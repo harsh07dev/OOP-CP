@@ -58,7 +58,8 @@ public:
     // Socket handle management
     socket_handle_t get_socket() const;
 
-    // Modular raw communication primitives
+    // Modular communication primitives
+    bool send_message(const std::string& message);
     bool send_raw(const std::string& data);
     int receive_raw(char* buffer, size_t buffer_size);
 

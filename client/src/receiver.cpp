@@ -5,7 +5,6 @@
 #include "client.h"
 
 #include <iostream>
-#include <vector>
 
 Receiver::Receiver(Client& client)
     : client_(client),
@@ -26,12 +25,15 @@ void Receiver::start() {
             buffer[bytes_received] = '\0';
             std::cout << buffer << std::flush;
         } else if (bytes_received == 0) {
-            std::cout << "\n[Notice] Server closed connection." << std::endl;
-            client_.disconnect();
+            if (is_running_) {
+                std::cout << "\n[Notice] Server closed connection. Press Enter to exit." << std::endl;
+                client_.disconnect();
+            }
             break;
         } else {
-            if (is_running_) {
-                std::cerr << "\n[Notice] Disconnected from server." << std::endl;
+            // Receive error occurred
+            if (is_running_ && client_.is_connected()) {
+                std::cerr << "\n[Error] Connection error while receiving from server." << std::endl;
                 client_.disconnect();
             }
             break;

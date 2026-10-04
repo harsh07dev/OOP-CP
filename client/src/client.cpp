@@ -63,15 +63,16 @@ void Client::cleanup_platform_networking() {
 }
 
 void Client::close_socket_handle() {
-    if (socket_fd_ != INVALID_SOCKET_HANDLE) {
-#ifdef _WIN32
-        shutdown(socket_fd_, SD_BOTH);
-        closesocket(socket_fd_);
-#else
-        shutdown(socket_fd_, SD_BOTH);
-        close(socket_fd_);
-#endif
+    socket_handle_t sock = socket_fd_;
+    if (sock != INVALID_SOCKET_HANDLE) {
         socket_fd_ = INVALID_SOCKET_HANDLE;
+#ifdef _WIN32
+        shutdown(sock, SD_BOTH);
+        closesocket(sock);
+#else
+        shutdown(sock, SD_BOTH);
+        close(sock);
+#endif
     }
 }
 
@@ -79,7 +80,7 @@ std::string Client::get_socket_error_message() const {
 #ifdef _WIN32
     int error_code = WSAGetLastError();
     std::ostringstream oss;
-    oss << "WSA Error code " << error_code;
+    oss << "WSA error " << error_code;
     return oss.str();
 #else
     return std::string(strerror(errno));
@@ -157,8 +158,8 @@ bool Client::connect_to_server(const std::string& ip, int port) {
 }
 
 void Client::disconnect() {
-    if (socket_fd_ != INVALID_SOCKET_HANDLE || is_connected_) {
-        is_connected_ = false;
+    bool was_connected = is_connected_.exchange(false);
+    if (was_connected || socket_fd_ != INVALID_SOCKET_HANDLE) {
         close_socket_handle();
         cleanup_platform_networking();
     }
@@ -170,6 +171,17 @@ bool Client::is_connected() const {
 
 socket_handle_t Client::get_socket() const {
     return socket_fd_;
+}
+
+bool Client::send_message(const std::string& message) {
+    if (!is_connected_) {
+        return false;
+    }
+    std::string wire_data = message;
+    if (wire_data.empty() || wire_data.back() != '\n') {
+        wire_data.push_back('\n');
+    }
+    return send_raw(wire_data);
 }
 
 bool Client::send_raw(const std::string& data) {

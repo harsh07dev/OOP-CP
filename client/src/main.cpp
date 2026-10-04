@@ -2,6 +2,9 @@
 // Prompts user for server IP, port, and username, connects to server, and starts sender/receiver threads.
 
 #include "client.h"
+#include "sender.h"
+#include "receiver.h"
+#include "thread_compat.h"
 
 #include <iostream>
 #include <string>
@@ -47,9 +50,34 @@ int main() {
     }
 
     std::cout << "Connected to server." << std::endl;
+    std::cout << "Type your messages below (/quit to exit):" << std::endl << std::endl;
 
-    // Graceful disconnect on exit
+    Receiver receiver(client);
+    Sender sender(client);
+
+    // Launch independent receiver thread
+    ChatThread receiver_thread([&receiver]() {
+        receiver.start();
+    });
+
+    // Launch independent sender thread
+    ChatThread sender_thread([&sender]() {
+        sender.start();
+    });
+
+    // Wait for sender to finish (e.g. user typed /quit or closed input stream)
+    if (sender_thread.joinable()) {
+        sender_thread.join();
+    }
+
+    // Stop receiver and ensure client socket disconnects
+    receiver.stop();
     client.disconnect();
+
+    // Wait for receiver thread to exit
+    if (receiver_thread.joinable()) {
+        receiver_thread.join();
+    }
 
     return 0;
 }
