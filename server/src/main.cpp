@@ -35,6 +35,8 @@ int main() {
         return 1;
     }
 
+    const std::string SERVER_RESPONSE = "Hello Client! Server received your message.";
+
     // 3. Process client connections and incoming messages sequentially
     while (server.isRunning()) {
         // Accept incoming client connection (blocking call)
@@ -42,10 +44,15 @@ int main() {
             break;
         }
 
-        // Receive message(s) from the connected client until disconnection
+        // Receive message(s) from the connected client and respond
         while (server.hasClientConnected() && server.isRunning()) {
-            if (!server.receiveMessage()) {
-                break; // Client disconnected or error occurred
+            if (server.receiveMessage()) {
+                // Send response back to the connected client
+                if (!server.sendMessage(SERVER_RESPONSE)) {
+                    break; // Send error occurred or connection was closed
+                }
+            } else {
+                break; // Client disconnected or receive error occurred
             }
         }
     }

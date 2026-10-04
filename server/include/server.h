@@ -8,6 +8,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <string>
 
 class Server {
 public:
@@ -26,6 +27,9 @@ public:
 
     // Receives a text message from the currently connected client
     bool receiveMessage();
+
+    // Sends a text message to the currently connected client
+    bool sendMessage(const std::string& message);
 
     // Shuts down the server and closes all associated socket resources
     void stop();

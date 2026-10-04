@@ -155,6 +155,49 @@ bool Server::receiveMessage() {
     }
 }
 
+bool Server::sendMessage(const std::string& message) {
+    if (!m_clientConnected || m_clientSocket == INVALID_SOCKET) {
+        std::cerr << "[ERROR] No connected client to send message to." << std::endl;
+        return false;
+    }
+
+    std::cout << "\nSending response to client..." << std::endl;
+
+    const char* dataPtr = message.data();
+    int totalBytes = static_cast<int>(message.length());
+    int totalBytesSent = 0;
+
+    // Note on Partial Sends:
+    // In TCP, send() does not guarantee transmitting all requested bytes in a single call.
+    // Handling partial sends in a loop ensures that all data is reliably transferred
+    // across varying TCP buffer states and window sizes without data loss.
+    while (totalBytesSent < totalBytes) {
+        int bytesSent = send(m_clientSocket,
+                             dataPtr + totalBytesSent,
+                             totalBytes - totalBytesSent,
+                             0);
+        if (bytesSent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            std::cerr << "[ERROR] send() failed with error code: " << err << std::endl;
+            closeSocket(m_clientSocket);
+            m_clientConnected = false;
+            return false;
+        }
+
+        if (bytesSent == 0) {
+            std::cerr << "[ERROR] send() returned 0 bytes (connection closed unexpectedly)." << std::endl;
+            closeSocket(m_clientSocket);
+            m_clientConnected = false;
+            return false;
+        }
+
+        totalBytesSent += bytesSent;
+    }
+
+    std::cout << "Response sent successfully." << std::endl;
+    return true;
+}
+
 bool Server::initializeSocket() {
     // Initialize Windows Winsock 2.2
     WSADATA wsaData;
