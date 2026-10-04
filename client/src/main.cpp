@@ -4,6 +4,7 @@
 #include "client.h"
 #include "sender.h"
 #include "receiver.h"
+#include "protocol_handler.h"
 #include "thread_compat.h"
 
 #include <iostream>
@@ -54,6 +55,9 @@ int main() {
     std::cout << "Type your message below." << std::endl;
     std::cout << "Use /quit to exit." << std::endl;
     std::cout << "----------------------------------------" << std::endl << std::endl;
+
+    // Send username registration according to protocol
+    client.send_raw(ProtocolHandler::format_join(client.get_username()));
 
     Receiver receiver(client);
     Sender sender(client);

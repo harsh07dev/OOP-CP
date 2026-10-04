@@ -3,6 +3,7 @@
 
 #include "receiver.h"
 #include "client.h"
+#include "protocol_handler.h"
 
 #include <iostream>
 
@@ -23,10 +24,16 @@ void Receiver::start() {
         int bytes_received = client_.receive_raw(buffer, sizeof(buffer) - 1);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
+
+            // Parse incoming payload through the protocol handler
+            ClientMessage msg = ProtocolHandler::parse(std::string(buffer, bytes_received));
+
             // Print incoming message cleanly and restore prompt
-            std::cout << "\r" << buffer;
-            if (buffer[bytes_received - 1] != '\n') {
-                std::cout << "\n";
+            std::cout << "\r";
+            if (msg.category == MessageCategory::SYSTEM) {
+                std::cout << msg.text << "\n";
+            } else {
+                std::cout << msg.text << "\n";
             }
             std::cout << "> " << std::flush;
         } else if (bytes_received == 0) {

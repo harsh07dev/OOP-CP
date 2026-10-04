@@ -3,6 +3,7 @@
 
 #include "sender.h"
 #include "client.h"
+#include "protocol_handler.h"
 
 #include <iostream>
 
@@ -34,13 +35,15 @@ void Sender::start() {
         // Handle /quit command
         if (line == "/quit") {
             std::cout << "\n[Notice] Disconnecting from server..." << std::endl;
+            client_.send_raw(ProtocolHandler::format_leave());
             client_.disconnect();
             break;
         }
 
-        // Send non-empty message through the client socket
+        // Send non-empty message formatted via protocol
         if (!line.empty()) {
-            if (!client_.send_message(line)) {
+            std::string payload = ProtocolHandler::format_chat(line);
+            if (!client_.send_raw(payload)) {
                 std::cerr << "\n[Error] Failed to send message: connection lost." << std::endl;
                 client_.disconnect();
                 break;
