@@ -1,11 +1,9 @@
 // main.cpp - Entry point for the chat server application.
-// Initializes the Server instance on port 8080, starts listening, and keeps the process alive.
+// Starts listening on port 8080, accepts client connections, and receives incoming messages.
 
 #include "server.h"
 
 #include <iostream>
-#include <thread>
-#include <chrono>
 #include <csignal>
 
 namespace {
@@ -21,26 +19,35 @@ namespace {
 }
 
 int main() {
-    // Register signal handlers for graceful shutdown on SIGINT (Ctrl+C) and SIGTERM
+    // Register signal handlers for clean termination on SIGINT (Ctrl+C) and SIGTERM
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
     constexpr int SERVER_PORT = 8080;
 
-    // 1. Create a Server object using port 8080
+    // 1. Create Server instance on port 8080
     Server server(SERVER_PORT);
     g_serverInstance = &server;
 
-    // 2. Start the server startup sequence
-    // 3. Report startup errors clearly
+    // 2. Start server sequence: socket() -> bind() -> listen()
     if (!server.start()) {
-        std::cerr << "[FATAL] Server startup sequence failed. Exiting.\n";
+        std::cerr << "[FATAL] Server startup sequence failed. Exiting." << std::endl;
         return 1;
     }
 
-    // 4. Keep the process alive after successful listen() for this prototype
+    // 3. Process client connections and incoming messages sequentially
     while (server.isRunning()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Accept incoming client connection (blocking call)
+        if (!server.acceptClient()) {
+            break;
+        }
+
+        // Receive message(s) from the connected client until disconnection
+        while (server.hasClientConnected() && server.isRunning()) {
+            if (!server.receiveMessage()) {
+                break; // Client disconnected or error occurred
+            }
+        }
     }
 
     return 0;

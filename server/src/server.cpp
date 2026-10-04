@@ -1,33 +1,22 @@
-// server.cpp - Implementation of the Server class.
-// Handles TCP socket creation, address configuration, binding, and listening.
+// server.cpp - Implementation of the Server class for Windows Winsock.
+// Handles TCP socket creation, binding, listening, and accepting client connections.
 
 #include "server.h"
 
 #include <iostream>
 #include <cstring>
 #include <cstdint>
-#include <cerrno>
-
-namespace {
-    // Helper function to retrieve the last platform-specific socket error code
-    int getLastSocketError() {
-#ifdef _WIN32
-        return WSAGetLastError();
-#else
-        return errno;
-#endif
-    }
-}
 
 Server::Server(int port)
     : m_port(port),
       m_serverSocket(INVALID_SOCKET),
-      m_isRunning(false)
-#ifdef _WIN32
-      , m_wsaInitialized(false)
-#endif
+      m_clientSocket(INVALID_SOCKET),
+      m_isRunning(false),
+      m_clientConnected(false),
+      m_wsaInitialized(false)
 {
     std::memset(&m_serverAddr, 0, sizeof(m_serverAddr));
+    std::memset(&m_clientAddr, 0, sizeof(m_clientAddr));
 }
 
 Server::~Server() {
@@ -62,49 +51,134 @@ bool Server::start() {
         return false;
     }
     std::cout << "Server listening on port " << m_port << "...\n" << std::endl;
-    std::cout << "Waiting for clients..." << std::endl;
 
     m_isRunning = true;
     return true;
 }
 
+bool Server::acceptClient() {
+    if (!m_isRunning || m_serverSocket == INVALID_SOCKET) {
+        std::cerr << "[ERROR] Server is not listening. Cannot accept connections." << std::endl;
+        return false;
+    }
+
+    std::cout << "Waiting for client connection..." << std::endl;
+
+    // accept() is a blocking call: it waits until an incoming client connection is received.
+    // The listening socket (m_serverSocket) accepts the connection and returns a new
+    // dedicated client socket (m_clientSocket) for subsequent communication.
+    int clientAddrLen = sizeof(m_clientAddr);
+    std::memset(&m_clientAddr, 0, sizeof(m_clientAddr));
+
+    m_clientSocket = accept(m_serverSocket, reinterpret_cast<SOCKADDR*>(&m_clientAddr), &clientAddrLen);
+    if (m_clientSocket == INVALID_SOCKET) {
+        int err = WSAGetLastError();
+        // If the server was deliberately stopped (e.g., via signal handler closing the socket), exit cleanly
+        if (!m_isRunning || err == WSAEINTR || err == WSAENOTSOCK) {
+            return false;
+        }
+        std::cerr << "[ERROR] accept() failed with error code: " << err << std::endl;
+        return false;
+    }
+
+    // Extract human-readable IP address from the client sockaddr_in structure
+    char ipBuffer[INET_ADDRSTRLEN] = {0};
+    if (inet_ntop(AF_INET, &(m_clientAddr.sin_addr), ipBuffer, sizeof(ipBuffer)) == nullptr) {
+        std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
+    }
+
+    // Extract client port (converted from network byte order to host byte order)
+    int clientPort = ntohs(m_clientAddr.sin_port);
+
+    std::cout << "\nClient connected!" << std::endl;
+    std::cout << "Client IP: " << ipBuffer << std::endl;
+    std::cout << "Client Port: " << clientPort << std::endl;
+
+    m_clientConnected = true;
+    return true;
+}
+
+bool Server::receiveMessage() {
+    if (!m_clientConnected || m_clientSocket == INVALID_SOCKET) {
+        std::cerr << "[ERROR] No client connected to receive messages from." << std::endl;
+        return false;
+    }
+
+    std::cout << "\nWaiting for client message..." << std::endl;
+
+    // Buffer to store incoming data.
+    // Fixed-size buffer of 1024 bytes for this prototype.
+    // Passing (BUFFER_SIZE - 1) guarantees space for a null terminator ('\0') without buffer overflow.
+    constexpr size_t BUFFER_SIZE = 1024;
+    char buffer[BUFFER_SIZE] = {0};
+
+    // Note on TCP Byte Streams:
+    // TCP is a connection-oriented, reliable byte-stream protocol.
+    // Unlike datagram-based protocols (e.g., UDP), TCP does not preserve application-level
+    // message boundaries. Data is transmitted as a continuous sequence of bytes.
+    // Therefore, one send() call on the client does not necessarily correspond to an exact
+    // single recv() call on the server in production (data can coalesce or fragment).
+    // For this prototype, plain text messages fit within the buffer and are processed directly.
+    // Explicit message framing and delimiters will be introduced in subsequent phases.
+    int bytesReceived = recv(m_clientSocket, buffer, static_cast<int>(BUFFER_SIZE - 1), 0);
+
+    // Case 1: Data was successfully received (bytesReceived > 0)
+    if (bytesReceived > 0) {
+        // Safe null-termination: ensure buffer is a valid C-string
+        buffer[bytesReceived] = '\0';
+
+        // Trim any trailing carriage return / newline characters for clean console display
+        while (bytesReceived > 0 && (buffer[bytesReceived - 1] == '\n' || buffer[bytesReceived - 1] == '\r')) {
+            buffer[--bytesReceived] = '\0';
+        }
+
+        std::cout << "Received: " << buffer << std::endl;
+        return true;
+    }
+    // Case 2: Client gracefully disconnected (bytesReceived == 0)
+    else if (bytesReceived == 0) {
+        std::cout << "Client disconnected." << std::endl;
+        closeSocket(m_clientSocket);
+        m_clientConnected = false;
+        return false;
+    }
+    // Case 3: A receive error occurred (bytesReceived < 0 / SOCKET_ERROR)
+    else {
+        int err = WSAGetLastError();
+        // If the socket was intentionally closed during server shutdown, avoid printing an error
+        if (m_isRunning && err != WSAEINTR && err != WSAENOTSOCK) {
+            std::cerr << "[ERROR] recv() failed with error code: " << err << std::endl;
+        }
+        closeSocket(m_clientSocket);
+        m_clientConnected = false;
+        return false;
+    }
+}
+
 bool Server::initializeSocket() {
-#ifdef _WIN32
-    // Initialize Winsock on Windows platforms
+    // Initialize Windows Winsock 2.2
     WSADATA wsaData;
     int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (wsaResult != 0) {
-        std::cerr << "[ERROR] WSAStartup failed with error code: " << wsaResult << "\n";
+        std::cerr << "[ERROR] WSAStartup failed with error code: " << wsaResult << std::endl;
         return false;
     }
     m_wsaInitialized = true;
-#endif
 
-    // Create a TCP stream socket using IPv4
-    // AF_INET     = IPv4 Internet protocols
-    // SOCK_STREAM = Sequenced, reliable, two-way, connection-based byte streams (TCP)
-    // 0           = Default protocol (IPPROTO_TCP)
+    // Create IPv4 TCP stream socket
     m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_serverSocket == INVALID_SOCKET) {
-        std::cerr << "[ERROR] socket() creation failed with error code: " << getLastSocketError() << "\n";
+        std::cerr << "[ERROR] socket() creation failed with error code: " << WSAGetLastError() << std::endl;
         return false;
     }
 
-    // Set SO_REUSEADDR so the port can be rebound immediately upon restart
+    // Set SO_REUSEADDR to enable immediate reuse of the local address/port upon restart
     int opt = 1;
-#ifdef _WIN32
     if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt)) == SOCKET_ERROR) {
-        std::cerr << "[WARNING] setsockopt(SO_REUSEADDR) failed with error: " << getLastSocketError() << "\n";
+        std::cerr << "[WARNING] setsockopt(SO_REUSEADDR) failed with error: " << WSAGetLastError() << std::endl;
     }
-#else
-    if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::cerr << "[WARNING] setsockopt(SO_REUSEADDR) failed with error: " << getLastSocketError() << "\n";
-    }
-#endif
 
-    // Configure the server address structure
-    // INADDR_ANY (0.0.0.0) binds the server to listen on all available local network interfaces.
-    // Notice: 0.0.0.0 is the server's listening interface, whereas clients connect via the host's actual LAN IP.
+    // Configure the server address structure to listen on all local network interfaces (0.0.0.0)
     std::memset(&m_serverAddr, 0, sizeof(m_serverAddr));
     m_serverAddr.sin_family = AF_INET;
     m_serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -114,81 +188,66 @@ bool Server::initializeSocket() {
 }
 
 bool Server::bindSocket() {
-    // Bind the socket to the IP address and port specified in m_serverAddr
-    int result = bind(m_serverSocket, reinterpret_cast<struct sockaddr*>(&m_serverAddr), sizeof(m_serverAddr));
+    // Bind the listening socket to port 8080 on 0.0.0.0
+    int result = bind(m_serverSocket, reinterpret_cast<SOCKADDR*>(&m_serverAddr), sizeof(m_serverAddr));
     if (result == SOCKET_ERROR) {
-        int err = getLastSocketError();
-        std::cerr << "[ERROR] bind() failed with error code: " << err << "\n";
+        int err = WSAGetLastError();
+        std::cerr << "[ERROR] bind() failed with error code: " << err << std::endl;
 
-#ifdef _WIN32
         if (err == WSAEADDRINUSE) {
-            std::cerr << "[ERROR] Diagnosis: Port " << m_port << " is already in use by another application.\n";
+            std::cerr << "[ERROR] Diagnosis: Port " << m_port << " is already in use by another application." << std::endl;
         } else if (err == WSAEACCES) {
-            std::cerr << "[ERROR] Diagnosis: Access denied. Insufficient permissions to bind to port " << m_port << ".\n";
+            std::cerr << "[ERROR] Diagnosis: Access denied. Insufficient permissions to bind to port " << m_port << "." << std::endl;
         } else if (err == WSAENOTSOCK) {
-            std::cerr << "[ERROR] Diagnosis: Invalid socket descriptor specified.\n";
+            std::cerr << "[ERROR] Diagnosis: Invalid socket descriptor specified." << std::endl;
         } else {
-            std::cerr << "[ERROR] Diagnosis: Check socket state or network configuration.\n";
+            std::cerr << "[ERROR] Diagnosis: Check socket state or network configuration." << std::endl;
         }
-#else
-        if (err == EADDRINUSE) {
-            std::cerr << "[ERROR] Diagnosis: Port " << m_port << " is already in use by another application.\n";
-        } else if (err == EACCES) {
-            std::cerr << "[ERROR] Diagnosis: Access denied. Insufficient permissions to bind to port " << m_port << ".\n";
-        } else if (err == ENOTSOCK) {
-            std::cerr << "[ERROR] Diagnosis: Invalid socket descriptor specified.\n";
-        } else {
-            std::cerr << "[ERROR] Diagnosis: Check socket state or network configuration (" << strerror(err) << ").\n";
-        }
-#endif
         return false;
     }
     return true;
 }
 
 bool Server::startListening() {
-    // Put socket into listening state
-    // Backlog specifies the maximum length of the queue of pending connections (5)
+    // Put socket into listening mode with a connection backlog of 5
     constexpr int BACKLOG = 5;
     int result = listen(m_serverSocket, BACKLOG);
     if (result == SOCKET_ERROR) {
-        std::cerr << "[ERROR] listen() failed with error code: " << getLastSocketError() << "\n";
+        std::cerr << "[ERROR] listen() failed with error code: " << WSAGetLastError() << std::endl;
         return false;
     }
     return true;
 }
 
-void Server::closeSocket(socket_t s) {
+void Server::closeSocket(SOCKET& s) {
     if (s != INVALID_SOCKET) {
-#ifdef _WIN32
         closesocket(s);
-#else
-        close(s);
-#endif
+        s = INVALID_SOCKET;
     }
 }
 
 void Server::cleanup() {
-    if (m_serverSocket != INVALID_SOCKET) {
-        closeSocket(m_serverSocket);
-        m_serverSocket = INVALID_SOCKET;
-    }
+    // Close the dedicated client socket if currently open
+    closeSocket(m_clientSocket);
 
-#ifdef _WIN32
+    // Close the primary listening server socket if currently open
+    closeSocket(m_serverSocket);
+
+    // Clean up Winsock subsystem
     if (m_wsaInitialized) {
         WSACleanup();
         m_wsaInitialized = false;
     }
-#endif
 
     m_isRunning = false;
+    m_clientConnected = false;
 }
 
 void Server::stop() {
     if (m_isRunning) {
-        std::cout << "\nStopping server...\n";
+        std::cout << "\nStopping server..." << std::endl;
         cleanup();
-        std::cout << "Server stopped.\n";
+        std::cout << "Server stopped." << std::endl;
     }
 }
 
@@ -198,4 +257,12 @@ bool Server::isRunning() const {
 
 int Server::getPort() const {
     return m_port;
+}
+
+SOCKET Server::getClientSocket() const {
+    return m_clientSocket;
+}
+
+bool Server::hasClientConnected() const {
+    return m_clientConnected;
 }

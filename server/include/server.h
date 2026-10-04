@@ -1,29 +1,13 @@
-// server.h - Declaration of the Server class.
-// Manages server socket setup, address configuration, binding, and listening for Phase 1 prototype.
+// server.h - Declaration of the Server class for Windows Winsock.
+// Manages server socket setup, binding, listening, and accepting client connections.
 
 #pragma once
 
-#ifdef _WIN32
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    using socket_t = SOCKET;
-#else
-    #include <sys/types.h>
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    using socket_t = int;
-    #ifndef INVALID_SOCKET
-        #define INVALID_SOCKET (-1)
-    #endif
-    #ifndef SOCKET_ERROR
-        #define SOCKET_ERROR (-1)
-    #endif
+#ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 class Server {
 public:
@@ -37,6 +21,12 @@ public:
     // Executes the complete TCP startup sequence: create -> configure -> bind -> listen
     bool start();
 
+    // Accepts an incoming client connection on the listening socket
+    bool acceptClient();
+
+    // Receives a text message from the currently connected client
+    bool receiveMessage();
+
     // Shuts down the server and closes all associated socket resources
     void stop();
 
@@ -46,6 +36,12 @@ public:
     // Returns the port the server is configured to listen on
     int getPort() const;
 
+    // Returns the accepted client socket descriptor
+    SOCKET getClientSocket() const;
+
+    // Checks if a client is currently connected
+    bool hasClientConnected() const;
+
 private:
     // Core TCP sequence steps
     bool initializeSocket();
@@ -53,16 +49,16 @@ private:
     bool startListening();
     void cleanup();
 
-    // Cross-platform helper to safely close a socket handle
-    void closeSocket(socket_t s);
+    // Helper to safely close and invalidate a socket handle
+    void closeSocket(SOCKET& s);
 
-    // Minimal state required for Phase 1
+    // State required for server networking and client connection
     int m_port;
-    socket_t m_serverSocket;
-    sockaddr_in m_serverAddr;
+    SOCKET m_serverSocket;    // Listening socket: listens for incoming TCP connections
+    SOCKET m_clientSocket;    // Client socket: communicates with the accepted client
+    sockaddr_in m_serverAddr; // Server address configuration
+    sockaddr_in m_clientAddr; // Accepted client address information
     bool m_isRunning;
-
-#ifdef _WIN32
+    bool m_clientConnected;
     bool m_wsaInitialized;
-#endif
 };
