@@ -23,17 +23,22 @@ void Receiver::start() {
         int bytes_received = client_.receive_raw(buffer, sizeof(buffer) - 1);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
-            std::cout << buffer << std::flush;
+            // Print incoming message cleanly and restore prompt
+            std::cout << "\r" << buffer;
+            if (buffer[bytes_received - 1] != '\n') {
+                std::cout << "\n";
+            }
+            std::cout << "> " << std::flush;
         } else if (bytes_received == 0) {
             if (is_running_) {
-                std::cout << "\n[Notice] Server closed connection. Press Enter to exit." << std::endl;
+                std::cout << "\n[Notice] Server disconnected. Press Enter to exit." << std::endl;
                 client_.disconnect();
             }
             break;
         } else {
-            // Receive error occurred
+            // Receive error occurred (connection lost / reset)
             if (is_running_ && client_.is_connected()) {
-                std::cerr << "\n[Error] Connection error while receiving from server." << std::endl;
+                std::cerr << "\n[Error] Connection error with server. Press Enter to exit." << std::endl;
                 client_.disconnect();
             }
             break;

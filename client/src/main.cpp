@@ -38,7 +38,7 @@ int main() {
         username_input = "Anonymous";
     }
 
-    std::cout << std::endl << "Connecting..." << std::endl << std::endl;
+    std::cout << std::endl << "Connecting to server..." << std::endl << std::endl;
 
     Client client;
     client.set_server_info(ip_input, port);
@@ -49,8 +49,11 @@ int main() {
         return 1;
     }
 
-    std::cout << "Connected to server." << std::endl;
-    std::cout << "Type your messages below (/quit to exit):" << std::endl << std::endl;
+    std::cout << "Connected successfully!" << std::endl << std::endl;
+    std::cout << "----------------------------------------" << std::endl;
+    std::cout << "Type your message below." << std::endl;
+    std::cout << "Use /quit to exit." << std::endl;
+    std::cout << "----------------------------------------" << std::endl << std::endl;
 
     Receiver receiver(client);
     Sender sender(client);
@@ -65,19 +68,20 @@ int main() {
         sender.start();
     });
 
-    // Wait for sender to finish (e.g. user typed /quit or closed input stream)
+    // Wait for sender to finish (/quit, stream closure, or disconnect)
     if (sender_thread.joinable()) {
         sender_thread.join();
     }
 
-    // Stop receiver and ensure client socket disconnects
+    // Stop receiver worker and disconnect client
     receiver.stop();
     client.disconnect();
 
-    // Wait for receiver thread to exit
+    // Wait for receiver thread to terminate
     if (receiver_thread.joinable()) {
         receiver_thread.join();
     }
 
+    std::cout << "Disconnected from server." << std::endl;
     return 0;
 }

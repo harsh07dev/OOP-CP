@@ -20,8 +20,10 @@ void Sender::start() {
     std::string line;
 
     while (is_running_ && client_.is_connected()) {
+        std::cout << "> " << std::flush;
+
         if (!std::getline(std::cin, line)) {
-            // EOF or stream error
+            // EOF or console stream closed
             break;
         }
 
@@ -31,7 +33,7 @@ void Sender::start() {
 
         // Handle /quit command
         if (line == "/quit") {
-            std::cout << "[Notice] Exiting chat..." << std::endl;
+            std::cout << "\n[Notice] Disconnecting from server..." << std::endl;
             client_.disconnect();
             break;
         }
@@ -39,7 +41,7 @@ void Sender::start() {
         // Send non-empty message through the client socket
         if (!line.empty()) {
             if (!client_.send_message(line)) {
-                std::cerr << "[Error] Failed to send message: connection lost." << std::endl;
+                std::cerr << "\n[Error] Failed to send message: connection lost." << std::endl;
                 client_.disconnect();
                 break;
             }
