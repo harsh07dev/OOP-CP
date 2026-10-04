@@ -2,10 +2,21 @@
 // Handles thread-safe client registration, lookup, removal, and message broadcasting.
 
 #include "client_manager.h"
+#include "logger.h"
 
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+
+ClientManager::ClientManager(Logger* logger)
+    : m_logger(logger)
+{
+}
+
+void ClientManager::setLogger(Logger* logger) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_logger = logger;
+}
 
 std::string ClientManager::formatEndpoint(const sockaddr_in& addr) {
     char ipBuffer[INET_ADDRSTRLEN] = {0};
@@ -32,8 +43,6 @@ bool ClientManager::addClient(SOCKET socket, const std::string& username, const 
     info.address = address;
     m_clients.push_back(info);
 
-    std::cout << "[ClientManager] Registered client: " << username 
-              << " (" << formatEndpoint(address) << ")" << std::endl;
     std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
 
     return true;
@@ -47,10 +56,8 @@ bool ClientManager::removeClient(SOCKET socket) {
     });
 
     if (it != m_clients.end()) {
-        std::string username = it->username;
         m_clients.erase(it);
 
-        std::cout << "[ClientManager] Removed client: " << username << std::endl;
         std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
         return true;
     }
@@ -82,10 +89,12 @@ std::vector<ClientInfo> ClientManager::getAllClients() const {
 
 void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSocket) {
     std::vector<ClientInfo> targets;
+    Logger* logger = nullptr;
 
     // Snapshot target clients under the mutex lock to prevent contention during socket I/O
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        logger = m_logger;
         targets.reserve(m_clients.size());
         for (const auto& client : m_clients) {
             if (client.socket != senderSocket) {
@@ -96,11 +105,11 @@ void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSo
 
     // Perform socket send operations outside the mutex lock
     for (const auto& target : targets) {
-        sendAll(target.socket, message, target.username);
+        sendAll(target.socket, message, target.username, logger);
     }
 }
 
-bool ClientManager::sendAll(SOCKET sock, const std::string& data, const std::string& username) {
+bool ClientManager::sendAll(SOCKET sock, const std::string& data, const std::string& username, Logger* logger) {
     if (sock == INVALID_SOCKET) {
         return false;
     }
@@ -117,13 +126,23 @@ bool ClientManager::sendAll(SOCKET sock, const std::string& data, const std::str
                              0);
         if (bytesSent == SOCKET_ERROR) {
             int err = WSAGetLastError();
-            std::cerr << "[ClientManager] Failed to send to " << username 
-                      << " (Winsock error: " << err << ")" << std::endl;
+            if (logger != nullptr) {
+                logger->warning("Failed to broadcast message to " + username 
+                                + " (Winsock error: " + std::to_string(err) + ")");
+            } else {
+                std::cerr << "[ClientManager] Failed to send to " << username 
+                          << " (Winsock error: " << err << ")" << std::endl;
+            }
             return false;
         }
 
         if (bytesSent == 0) {
-            std::cerr << "[ClientManager] send() returned 0 bytes to " << username << std::endl;
+            if (logger != nullptr) {
+                logger->warning("Failed to broadcast message to " + username 
+                                + " (send returned 0 bytes)");
+            } else {
+                std::cerr << "[ClientManager] send() returned 0 bytes to " << username << std::endl;
+            }
             return false;
         }
 

@@ -12,6 +12,7 @@
 #include <string>
 
 #include "client_manager.h"
+#include "logger.h"
 
 class Server {
 public:
@@ -54,6 +55,7 @@ private:
     int m_port;
     SOCKET m_serverSocket;    // Listening socket: listens for incoming TCP connections
     sockaddr_in m_serverAddr; // Server address configuration
+    Logger m_logger;          // Thread-safe timestamped logger
     ClientManager m_clientManager; // Thread-safe active client registry
     bool m_isRunning;
     bool m_wsaInitialized;

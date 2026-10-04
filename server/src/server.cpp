@@ -10,6 +10,8 @@
 Server::Server(int port)
     : m_port(port),
       m_serverSocket(INVALID_SOCKET),
+      m_logger("logs/chat.log"),
+      m_clientManager(&m_logger),
       m_isRunning(false),
       m_wsaInitialized(false)
 {
@@ -25,29 +27,31 @@ bool Server::start() {
     std::cout << "        TCP CHAT SERVER         \n";
     std::cout << "================================\n" << std::endl;
 
+    m_logger.info("Server starting.");
+
     // Step 1: Create socket and configure address structure
     if (!initializeSocket()) {
-        std::cerr << "[ERROR] Failed to initialize server socket." << std::endl;
+        m_logger.error("Failed to initialize server socket.");
         cleanup();
         return false;
     }
-    std::cout << "Server socket created." << std::endl;
+    m_logger.info("Server socket created.");
 
     // Step 2: Bind socket to IP address and port
     if (!bindSocket()) {
-        std::cerr << "[ERROR] Failed to bind socket to port " << m_port << "." << std::endl;
+        m_logger.error("Failed to bind socket to port " + std::to_string(m_port) + ".");
         cleanup();
         return false;
     }
-    std::cout << "Server bound to port " << m_port << "." << std::endl;
+    m_logger.info("Server bound to port " + std::to_string(m_port) + ".");
 
     // Step 3: Put socket into listening state
     if (!startListening()) {
-        std::cerr << "[ERROR] Failed to start listening on port " << m_port << "." << std::endl;
+        m_logger.error("Failed to start listening on port " + std::to_string(m_port) + ".");
         cleanup();
         return false;
     }
-    std::cout << "Server listening on port " << m_port << "...\n" << std::endl;
+    m_logger.info("Server listening on port " + std::to_string(m_port) + ".");
 
     m_isRunning = true;
     return true;
@@ -55,7 +59,7 @@ bool Server::start() {
 
 bool Server::acceptClient() {
     if (!m_isRunning || m_serverSocket == INVALID_SOCKET) {
-        std::cerr << "[ERROR] Server is not listening. Cannot accept connections." << std::endl;
+        m_logger.error("Server is not listening. Cannot accept connections.");
         return false;
     }
 
@@ -73,7 +77,7 @@ bool Server::acceptClient() {
         if (!m_isRunning || err == WSAEINTR || err == WSAENOTSOCK) {
             return false;
         }
-        std::cerr << "[ERROR] accept() failed with error code: " << err << std::endl;
+        m_logger.error("accept() failed with error code: " + std::to_string(err));
         return false;
     }
 
@@ -83,10 +87,9 @@ bool Server::acceptClient() {
         std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
     }
     int clientPort = ntohs(clientAddr.sin_port);
+    std::string clientEndpoint = std::string(ipBuffer) + ":" + std::to_string(clientPort);
 
-    std::cout << "\nClient connected!" << std::endl;
-    std::cout << "Client IP: " << ipBuffer << std::endl;
-    std::cout << "Client Port: " << clientPort << std::endl;
+    m_logger.info("Client connected: " + clientEndpoint);
 
     // Spawn a dedicated worker thread for this accepted client connection.
     // Detach the thread so that it runs independently, allowing the main thread
@@ -103,10 +106,12 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
         std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
     }
     int clientPort = ntohs(clientAddr.sin_port);
+    std::string clientEndpoint = std::string(ipBuffer) + ":" + std::to_string(clientPort);
 
     std::string receiveBuffer;
     bool isRegistered = false;
     std::string registeredUsername;
+    bool userRequestedQuit = false;
 
     constexpr size_t RAW_BUFFER_SIZE = 1024;
     char rawBuffer[RAW_BUFFER_SIZE];
@@ -134,8 +139,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                 // First message must be interpreted as username registration
                 if (!isRegistered) {
                     if (line.empty()) {
-                        std::cerr << "[ClientManager] Registration rejected: empty username from " 
-                                  << ipBuffer << ":" << clientPort << std::endl;
+                        m_logger.warning("Client registration rejected: empty username (" + clientEndpoint + ")");
                         shouldExit = true;
                         break;
                     }
@@ -143,13 +147,14 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                     registeredUsername = line;
                     if (m_clientManager.addClient(clientSocket, registeredUsername, clientAddr)) {
                         isRegistered = true;
+                        m_logger.info("User registered: " + registeredUsername + " (" + clientEndpoint + ")");
+                        m_logger.info("User joined: " + registeredUsername);
 
                         // Broadcast join notification to all other connected clients
                         std::string joinNotification = "[System] " + registeredUsername + " has joined the chat.\n";
                         m_clientManager.broadcastMessage(joinNotification, clientSocket);
                     } else {
-                        std::cerr << "[ClientManager] Failed to register client: " 
-                                  << registeredUsername << std::endl;
+                        m_logger.error("Failed to register client: " + registeredUsername + " (" + clientEndpoint + ")");
                         shouldExit = true;
                         break;
                     }
@@ -158,13 +163,13 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
 
                 // Handle graceful disconnect command (/quit)
                 if (line == "/quit") {
-                    std::cout << "[" << registeredUsername << "] requested disconnect via /quit" << std::endl;
+                    userRequestedQuit = true;
                     shouldExit = true;
                     break;
                 }
 
-                // Display normal chat message on server console
-                std::cout << "[" << registeredUsername << "] " << line << std::endl;
+                // Log received normal chat message as a CHAT event
+                m_logger.chat("[" + registeredUsername + "]: " + line);
 
                 // Broadcast chat message to all other connected clients
                 std::string chatMessage = "[" + registeredUsername + "]: " + line + "\n";
@@ -182,8 +187,8 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
         else {
             int err = WSAGetLastError();
             if (m_isRunning && err != WSAEINTR && err != WSAECONNRESET && err != WSAENOTSOCK) {
-                std::cerr << "[" << (isRegistered ? registeredUsername : (std::string(ipBuffer) + ":" + std::to_string(clientPort)))
-                          << "] recv() error: " << err << std::endl;
+                m_logger.error("recv() failed for " + (isRegistered ? registeredUsername : clientEndpoint)
+                               + " with error code: " + std::to_string(err));
             }
             break;
         }
@@ -194,6 +199,12 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
         std::string departingUser = registeredUsername;
         m_clientManager.removeClient(clientSocket);
         isRegistered = false;
+
+        if (userRequestedQuit) {
+            m_logger.info("User left: " + departingUser + " (requested disconnect)");
+        } else {
+            m_logger.info("User disconnected: " + departingUser);
+        }
 
         // Broadcast leave notification to all remaining connected clients
         std::string leaveNotification = "[System] " + departingUser + " has left the chat.\n";
@@ -209,22 +220,23 @@ bool Server::initializeSocket() {
     WSADATA wsaData;
     int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
     if (wsaResult != 0) {
-        std::cerr << "[ERROR] WSAStartup failed with error code: " << wsaResult << std::endl;
+        m_logger.error("WSAStartup failed with error code: " + std::to_string(wsaResult));
         return false;
     }
     m_wsaInitialized = true;
+    m_logger.info("Winsock initialized.");
 
     // Create IPv4 TCP stream socket
     m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_serverSocket == INVALID_SOCKET) {
-        std::cerr << "[ERROR] socket() creation failed with error code: " << WSAGetLastError() << std::endl;
+        m_logger.error("socket() creation failed with error code: " + std::to_string(WSAGetLastError()));
         return false;
     }
 
     // Set SO_REUSEADDR to enable immediate reuse of the local address/port upon restart
     int opt = 1;
     if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt)) == SOCKET_ERROR) {
-        std::cerr << "[WARNING] setsockopt(SO_REUSEADDR) failed with error: " << WSAGetLastError() << std::endl;
+        m_logger.warning("setsockopt(SO_REUSEADDR) failed with error code: " + std::to_string(WSAGetLastError()));
     }
 
     // Configure the server address structure to listen on all local network interfaces (0.0.0.0)
@@ -241,16 +253,16 @@ bool Server::bindSocket() {
     int result = bind(m_serverSocket, reinterpret_cast<SOCKADDR*>(&m_serverAddr), sizeof(m_serverAddr));
     if (result == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        std::cerr << "[ERROR] bind() failed with error code: " << err << std::endl;
+        m_logger.error("bind() failed on port " + std::to_string(m_port) + " with error code: " + std::to_string(err));
 
         if (err == WSAEADDRINUSE) {
-            std::cerr << "[ERROR] Diagnosis: Port " << m_port << " is already in use by another application." << std::endl;
+            m_logger.error("Diagnosis: Port " + std::to_string(m_port) + " is already in use by another application.");
         } else if (err == WSAEACCES) {
-            std::cerr << "[ERROR] Diagnosis: Access denied. Insufficient permissions to bind to port " << m_port << "." << std::endl;
+            m_logger.error("Diagnosis: Access denied. Insufficient permissions to bind to port " + std::to_string(m_port) + ".");
         } else if (err == WSAENOTSOCK) {
-            std::cerr << "[ERROR] Diagnosis: Invalid socket descriptor specified." << std::endl;
+            m_logger.error("Diagnosis: Invalid socket descriptor specified.");
         } else {
-            std::cerr << "[ERROR] Diagnosis: Check socket state or network configuration." << std::endl;
+            m_logger.error("Diagnosis: Check socket state or network configuration.");
         }
         return false;
     }
@@ -262,7 +274,7 @@ bool Server::startListening() {
     constexpr int BACKLOG = 5;
     int result = listen(m_serverSocket, BACKLOG);
     if (result == SOCKET_ERROR) {
-        std::cerr << "[ERROR] listen() failed with error code: " << WSAGetLastError() << std::endl;
+        m_logger.error("listen() failed with error code: " + std::to_string(WSAGetLastError()));
         return false;
     }
     return true;
@@ -290,9 +302,9 @@ void Server::cleanup() {
 
 void Server::stop() {
     if (m_isRunning) {
-        std::cout << "\nStopping server..." << std::endl;
+        m_logger.info("Server shutting down.");
         cleanup();
-        std::cout << "Server stopped." << std::endl;
+        m_logger.info("Server stopped.");
     }
 }
 

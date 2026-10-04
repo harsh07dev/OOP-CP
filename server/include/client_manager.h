@@ -20,14 +20,19 @@ struct ClientInfo {
     sockaddr_in address{};
 };
 
+class Logger;
+
 class ClientManager {
 public:
-    ClientManager() = default;
+    explicit ClientManager(Logger* logger = nullptr);
     ~ClientManager() = default;
 
     // Disable copy semantics to protect the mutex and unique registry state
     ClientManager(const ClientManager&) = delete;
     ClientManager& operator=(const ClientManager&) = delete;
+
+    // Configure logger reference for broadcast error reporting
+    void setLogger(Logger* logger);
 
     // Thread-safe registration of a new client
     bool addClient(SOCKET socket, const std::string& username, const sockaddr_in& address);
@@ -49,11 +54,12 @@ public:
     void broadcastMessage(const std::string& message, SOCKET senderSocket = INVALID_SOCKET);
 
     // Reliable send helper handling partial sends across TCP byte streams
-    static bool sendAll(SOCKET sock, const std::string& data, const std::string& username);
+    static bool sendAll(SOCKET sock, const std::string& data, const std::string& username, Logger* logger = nullptr);
 
 private:
     mutable std::mutex m_mutex;
     std::vector<ClientInfo> m_clients;
+    Logger* m_logger{nullptr};
 
     static std::string formatEndpoint(const sockaddr_in& addr);
 };
