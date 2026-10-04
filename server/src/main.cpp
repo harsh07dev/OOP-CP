@@ -1,5 +1,6 @@
 // main.cpp - Entry point for the chat server application.
-// Starts listening on port 8080, accepts client connections, and receives incoming messages.
+// Starts listening on port 8080 and continuously accepts incoming client connections,
+// spawning a dedicated worker thread per client.
 
 #include "server.h"
 
@@ -35,25 +36,12 @@ int main() {
         return 1;
     }
 
-    const std::string SERVER_RESPONSE = "Hello Client! Server received your message.";
-
-    // 3. Process client connections and incoming messages sequentially
+    // 3. Continuously accept clients on the main thread.
+    // Each accepted client is dispatched to an independent worker thread inside acceptClient(),
+    // allowing multiple clients to remain connected simultaneously.
     while (server.isRunning()) {
-        // Accept incoming client connection (blocking call)
         if (!server.acceptClient()) {
             break;
-        }
-
-        // Receive message(s) from the connected client and respond
-        while (server.hasClientConnected() && server.isRunning()) {
-            if (server.receiveMessage()) {
-                // Send response back to the connected client
-                if (!server.sendMessage(SERVER_RESPONSE)) {
-                    break; // Send error occurred or connection was closed
-                }
-            } else {
-                break; // Client disconnected or receive error occurred
-            }
         }
     }
 

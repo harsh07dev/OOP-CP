@@ -1,5 +1,5 @@
 // server.cpp - Implementation of the Server class for Windows Winsock.
-// Handles TCP socket creation, binding, listening, and accepting client connections.
+// Handles TCP socket creation, binding, listening, and concurrent client handling with dedicated worker threads.
 
 #include "server.h"
 
@@ -10,13 +10,10 @@
 Server::Server(int port)
     : m_port(port),
       m_serverSocket(INVALID_SOCKET),
-      m_clientSocket(INVALID_SOCKET),
       m_isRunning(false),
-      m_clientConnected(false),
       m_wsaInitialized(false)
 {
     std::memset(&m_serverAddr, 0, sizeof(m_serverAddr));
-    std::memset(&m_clientAddr, 0, sizeof(m_clientAddr));
 }
 
 Server::~Server() {
@@ -64,16 +61,15 @@ bool Server::acceptClient() {
 
     std::cout << "Waiting for client connection..." << std::endl;
 
-    // accept() is a blocking call: it waits until an incoming client connection is received.
-    // The listening socket (m_serverSocket) accepts the connection and returns a new
-    // dedicated client socket (m_clientSocket) for subsequent communication.
-    int clientAddrLen = sizeof(m_clientAddr);
-    std::memset(&m_clientAddr, 0, sizeof(m_clientAddr));
+    sockaddr_in clientAddr;
+    int clientAddrLen = sizeof(clientAddr);
+    std::memset(&clientAddr, 0, sizeof(clientAddr));
 
-    m_clientSocket = accept(m_serverSocket, reinterpret_cast<SOCKADDR*>(&m_clientAddr), &clientAddrLen);
-    if (m_clientSocket == INVALID_SOCKET) {
+    // accept() blocks until an incoming connection arrives on the listening socket
+    SOCKET clientSocket = accept(m_serverSocket, reinterpret_cast<SOCKADDR*>(&clientAddr), &clientAddrLen);
+    if (clientSocket == INVALID_SOCKET) {
         int err = WSAGetLastError();
-        // If the server was deliberately stopped (e.g., via signal handler closing the socket), exit cleanly
+        // If the server was stopped (e.g., via signal handler closing m_serverSocket), exit cleanly
         if (!m_isRunning || err == WSAEINTR || err == WSAENOTSOCK) {
             return false;
         }
@@ -81,121 +77,118 @@ bool Server::acceptClient() {
         return false;
     }
 
-    // Extract human-readable IP address from the client sockaddr_in structure
+    // Extract client IP and port for reporting
     char ipBuffer[INET_ADDRSTRLEN] = {0};
-    if (inet_ntop(AF_INET, &(m_clientAddr.sin_addr), ipBuffer, sizeof(ipBuffer)) == nullptr) {
+    if (inet_ntop(AF_INET, &(clientAddr.sin_addr), ipBuffer, sizeof(ipBuffer)) == nullptr) {
         std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
     }
-
-    // Extract client port (converted from network byte order to host byte order)
-    int clientPort = ntohs(m_clientAddr.sin_port);
+    int clientPort = ntohs(clientAddr.sin_port);
 
     std::cout << "\nClient connected!" << std::endl;
     std::cout << "Client IP: " << ipBuffer << std::endl;
     std::cout << "Client Port: " << clientPort << std::endl;
 
-    m_clientConnected = true;
+    // Spawn a dedicated worker thread for this accepted client connection.
+    // Detach the thread so that it runs independently, allowing the main thread
+    // to immediately return to accept() and handle additional incoming clients concurrently.
+    std::thread clientThread(&Server::handleClient, this, clientSocket, clientAddr);
+    clientThread.detach();
+
     return true;
 }
 
-bool Server::receiveMessage() {
-    if (!m_clientConnected || m_clientSocket == INVALID_SOCKET) {
-        std::cerr << "[ERROR] No client connected to receive messages from." << std::endl;
-        return false;
+void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
+    char ipBuffer[INET_ADDRSTRLEN] = {0};
+    if (inet_ntop(AF_INET, &(clientAddr.sin_addr), ipBuffer, sizeof(ipBuffer)) == nullptr) {
+        std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
     }
+    int clientPort = ntohs(clientAddr.sin_port);
 
-    std::cout << "\nWaiting for client message..." << std::endl;
+    std::string receiveBuffer;
+    bool isRegistered = false;
+    std::string registeredUsername;
 
-    // Buffer to store incoming data.
-    // Fixed-size buffer of 1024 bytes for this prototype.
-    // Passing (BUFFER_SIZE - 1) guarantees space for a null terminator ('\0') without buffer overflow.
-    constexpr size_t BUFFER_SIZE = 1024;
-    char buffer[BUFFER_SIZE] = {0};
+    constexpr size_t RAW_BUFFER_SIZE = 1024;
+    char rawBuffer[RAW_BUFFER_SIZE];
 
-    // Note on TCP Byte Streams:
-    // TCP is a connection-oriented, reliable byte-stream protocol.
-    // Unlike datagram-based protocols (e.g., UDP), TCP does not preserve application-level
-    // message boundaries. Data is transmitted as a continuous sequence of bytes.
-    // Therefore, one send() call on the client does not necessarily correspond to an exact
-    // single recv() call on the server in production (data can coalesce or fragment).
-    // For this prototype, plain text messages fit within the buffer and are processed directly.
-    // Explicit message framing and delimiters will be introduced in subsequent phases.
-    int bytesReceived = recv(m_clientSocket, buffer, static_cast<int>(BUFFER_SIZE - 1), 0);
+    // Continuously read network stream from this client socket
+    while (m_isRunning) {
+        int bytesReceived = recv(clientSocket, rawBuffer, sizeof(rawBuffer), 0);
 
-    // Case 1: Data was successfully received (bytesReceived > 0)
-    if (bytesReceived > 0) {
-        // Safe null-termination: ensure buffer is a valid C-string
-        buffer[bytesReceived] = '\0';
+        if (bytesReceived > 0) {
+            receiveBuffer.append(rawBuffer, bytesReceived);
 
-        // Trim any trailing carriage return / newline characters for clean console display
-        while (bytesReceived > 0 && (buffer[bytesReceived - 1] == '\n' || buffer[bytesReceived - 1] == '\r')) {
-            buffer[--bytesReceived] = '\0';
+            // Extract and process all complete newline-delimited messages from the stream
+            size_t newlinePos;
+            bool shouldExit = false;
+
+            while ((newlinePos = receiveBuffer.find('\n')) != std::string::npos) {
+                std::string line = receiveBuffer.substr(0, newlinePos);
+                receiveBuffer.erase(0, newlinePos + 1);
+
+                // Strip trailing carriage return if present
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+
+                // First message must be interpreted as username registration
+                if (!isRegistered) {
+                    if (line.empty()) {
+                        std::cerr << "[ClientManager] Registration rejected: empty username from " 
+                                  << ipBuffer << ":" << clientPort << std::endl;
+                        shouldExit = true;
+                        break;
+                    }
+
+                    registeredUsername = line;
+                    if (m_clientManager.addClient(clientSocket, registeredUsername, clientAddr)) {
+                        isRegistered = true;
+                    } else {
+                        std::cerr << "[ClientManager] Failed to register client: " 
+                                  << registeredUsername << std::endl;
+                        shouldExit = true;
+                        break;
+                    }
+                    continue; // First message handled; proceed to next line or next recv
+                }
+
+                // Handle graceful disconnect command (/quit)
+                if (line == "/quit") {
+                    std::cout << "[" << registeredUsername << "] /quit" << std::endl;
+                    shouldExit = true;
+                    break;
+                }
+
+                // Display normal chat message on server console
+                std::cout << "[" << registeredUsername << "] " << line << std::endl;
+            }
+
+            if (shouldExit) {
+                break;
+            }
         }
-
-        std::cout << "Received: " << buffer << std::endl;
-        return true;
-    }
-    // Case 2: Client gracefully disconnected (bytesReceived == 0)
-    else if (bytesReceived == 0) {
-        std::cout << "Client disconnected." << std::endl;
-        closeSocket(m_clientSocket);
-        m_clientConnected = false;
-        return false;
-    }
-    // Case 3: A receive error occurred (bytesReceived < 0 / SOCKET_ERROR)
-    else {
-        int err = WSAGetLastError();
-        // If the socket was intentionally closed during server shutdown, avoid printing an error
-        if (m_isRunning && err != WSAEINTR && err != WSAENOTSOCK) {
-            std::cerr << "[ERROR] recv() failed with error code: " << err << std::endl;
+        else if (bytesReceived == 0) {
+            // Client closed connection gracefully
+            break;
         }
-        closeSocket(m_clientSocket);
-        m_clientConnected = false;
-        return false;
-    }
-}
-
-bool Server::sendMessage(const std::string& message) {
-    if (!m_clientConnected || m_clientSocket == INVALID_SOCKET) {
-        std::cerr << "[ERROR] No connected client to send message to." << std::endl;
-        return false;
-    }
-
-    std::cout << "\nSending response to client..." << std::endl;
-
-    const char* dataPtr = message.data();
-    int totalBytes = static_cast<int>(message.length());
-    int totalBytesSent = 0;
-
-    // Note on Partial Sends:
-    // In TCP, send() does not guarantee transmitting all requested bytes in a single call.
-    // Handling partial sends in a loop ensures that all data is reliably transferred
-    // across varying TCP buffer states and window sizes without data loss.
-    while (totalBytesSent < totalBytes) {
-        int bytesSent = send(m_clientSocket,
-                             dataPtr + totalBytesSent,
-                             totalBytes - totalBytesSent,
-                             0);
-        if (bytesSent == SOCKET_ERROR) {
+        else {
             int err = WSAGetLastError();
-            std::cerr << "[ERROR] send() failed with error code: " << err << std::endl;
-            closeSocket(m_clientSocket);
-            m_clientConnected = false;
-            return false;
+            if (m_isRunning && err != WSAEINTR && err != WSAECONNRESET && err != WSAENOTSOCK) {
+                std::cerr << "[" << (isRegistered ? registeredUsername : (std::string(ipBuffer) + ":" + std::to_string(clientPort)))
+                          << "] recv() error: " << err << std::endl;
+            }
+            break;
         }
-
-        if (bytesSent == 0) {
-            std::cerr << "[ERROR] send() returned 0 bytes (connection closed unexpectedly)." << std::endl;
-            closeSocket(m_clientSocket);
-            m_clientConnected = false;
-            return false;
-        }
-
-        totalBytesSent += bytesSent;
     }
 
-    std::cout << "Response sent successfully." << std::endl;
-    return true;
+    // Unregister client from ClientManager if registration had succeeded
+    if (isRegistered) {
+        m_clientManager.removeClient(clientSocket);
+        isRegistered = false;
+    }
+
+    // Cleanly close this worker's client socket exactly once
+    closesocket(clientSocket);
 }
 
 bool Server::initializeSocket() {
@@ -270,9 +263,6 @@ void Server::closeSocket(SOCKET& s) {
 }
 
 void Server::cleanup() {
-    // Close the dedicated client socket if currently open
-    closeSocket(m_clientSocket);
-
     // Close the primary listening server socket if currently open
     closeSocket(m_serverSocket);
 
@@ -283,7 +273,6 @@ void Server::cleanup() {
     }
 
     m_isRunning = false;
-    m_clientConnected = false;
 }
 
 void Server::stop() {
@@ -300,12 +289,4 @@ bool Server::isRunning() const {
 
 int Server::getPort() const {
     return m_port;
-}
-
-SOCKET Server::getClientSocket() const {
-    return m_clientSocket;
-}
-
-bool Server::hasClientConnected() const {
-    return m_clientConnected;
 }
