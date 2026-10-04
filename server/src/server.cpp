@@ -143,6 +143,10 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                     registeredUsername = line;
                     if (m_clientManager.addClient(clientSocket, registeredUsername, clientAddr)) {
                         isRegistered = true;
+
+                        // Broadcast join notification to all other connected clients
+                        std::string joinNotification = "[System] " + registeredUsername + " has joined the chat.\n";
+                        m_clientManager.broadcastMessage(joinNotification, clientSocket);
                     } else {
                         std::cerr << "[ClientManager] Failed to register client: " 
                                   << registeredUsername << std::endl;
@@ -154,13 +158,17 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
 
                 // Handle graceful disconnect command (/quit)
                 if (line == "/quit") {
-                    std::cout << "[" << registeredUsername << "] /quit" << std::endl;
+                    std::cout << "[" << registeredUsername << "] requested disconnect via /quit" << std::endl;
                     shouldExit = true;
                     break;
                 }
 
                 // Display normal chat message on server console
                 std::cout << "[" << registeredUsername << "] " << line << std::endl;
+
+                // Broadcast chat message to all other connected clients
+                std::string chatMessage = "[" + registeredUsername + "]: " + line + "\n";
+                m_clientManager.broadcastMessage(chatMessage, clientSocket);
             }
 
             if (shouldExit) {
@@ -181,10 +189,15 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
         }
     }
 
-    // Unregister client from ClientManager if registration had succeeded
+    // Unregister client from ClientManager before broadcasting leave notification
     if (isRegistered) {
+        std::string departingUser = registeredUsername;
         m_clientManager.removeClient(clientSocket);
         isRegistered = false;
+
+        // Broadcast leave notification to all remaining connected clients
+        std::string leaveNotification = "[System] " + departingUser + " has left the chat.\n";
+        m_clientManager.broadcastMessage(leaveNotification, clientSocket);
     }
 
     // Cleanly close this worker's client socket exactly once

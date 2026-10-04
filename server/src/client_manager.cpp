@@ -1,5 +1,5 @@
 // client_manager.cpp - Implementation of the ClientManager class.
-// Handles thread-safe client registration, lookup, and removal.
+// Handles thread-safe client registration, lookup, removal, and message broadcasting.
 
 #include "client_manager.h"
 
@@ -78,4 +78,57 @@ bool ClientManager::getClientInfo(SOCKET socket, ClientInfo& outInfo) const {
 std::vector<ClientInfo> ClientManager::getAllClients() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_clients;
+}
+
+void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSocket) {
+    std::vector<ClientInfo> targets;
+
+    // Snapshot target clients under the mutex lock to prevent contention during socket I/O
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        targets.reserve(m_clients.size());
+        for (const auto& client : m_clients) {
+            if (client.socket != senderSocket) {
+                targets.push_back(client);
+            }
+        }
+    }
+
+    // Perform socket send operations outside the mutex lock
+    for (const auto& target : targets) {
+        sendAll(target.socket, message, target.username);
+    }
+}
+
+bool ClientManager::sendAll(SOCKET sock, const std::string& data, const std::string& username) {
+    if (sock == INVALID_SOCKET) {
+        return false;
+    }
+
+    const char* dataPtr = data.data();
+    size_t totalBytes = data.size();
+    size_t totalSent = 0;
+
+    // Reliable partial-send loop ensuring full transmission of the payload
+    while (totalSent < totalBytes) {
+        int bytesSent = send(sock,
+                             dataPtr + totalSent,
+                             static_cast<int>(totalBytes - totalSent),
+                             0);
+        if (bytesSent == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            std::cerr << "[ClientManager] Failed to send to " << username 
+                      << " (Winsock error: " << err << ")" << std::endl;
+            return false;
+        }
+
+        if (bytesSent == 0) {
+            std::cerr << "[ClientManager] send() returned 0 bytes to " << username << std::endl;
+            return false;
+        }
+
+        totalSent += static_cast<size_t>(bytesSent);
+    }
+
+    return true;
 }

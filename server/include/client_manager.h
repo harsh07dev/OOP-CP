@@ -1,5 +1,5 @@
 // client_manager.h - Declaration of the ClientManager class and ClientInfo structure.
-// Manages thread-safe connected client registration, lookup, and removal.
+// Manages thread-safe connected client registration, lookup, removal, and message broadcasting.
 
 #pragma once
 
@@ -41,8 +41,15 @@ public:
     // Thread-safe retrieval of specific client information
     bool getClientInfo(SOCKET socket, ClientInfo& outInfo) const;
 
-    // Thread-safe snapshot of all active clients (for future broadcasting)
+    // Thread-safe snapshot of all active clients
     std::vector<ClientInfo> getAllClients() const;
+
+    // Thread-safe message broadcasting to all connected clients except senderSocket.
+    // Snapshots recipients under the mutex and executes network send() calls outside the lock.
+    void broadcastMessage(const std::string& message, SOCKET senderSocket = INVALID_SOCKET);
+
+    // Reliable send helper handling partial sends across TCP byte streams
+    static bool sendAll(SOCKET sock, const std::string& data, const std::string& username);
 
 private:
     mutable std::mutex m_mutex;
