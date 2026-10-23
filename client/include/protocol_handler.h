@@ -5,6 +5,7 @@
 // Decouples message framing and protocol serialization from networking and UI logic.
 
 #include <string>
+#include "protocol.h"
 
 enum class MessageCategory {
     CHAT,
@@ -24,17 +25,17 @@ class ProtocolHandler {
 public:
     // Formats username registration (JOIN message)
     static std::string format_join(const std::string& username) {
-        return username + "\n";
+        return username + protocol::DELIMITER;
     }
 
     // Formats outgoing chat messages (CHAT message)
     static std::string format_chat(const std::string& message) {
-        return message + "\n";
+        return message + protocol::DELIMITER;
     }
 
     // Formats graceful disconnection request (LEAVE message)
     static std::string format_leave() {
-        return "/quit\n";
+        return std::string(protocol::CMD_QUIT) + protocol::DELIMITER;
     }
 
     // Parses raw incoming server payload into structured ClientMessage
@@ -43,13 +44,13 @@ public:
         msg.raw = raw_data;
 
         std::string trimmed = raw_data;
-        while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+        while (!trimmed.empty() && (trimmed.back() == protocol::DELIMITER || trimmed.back() == '\r')) {
             trimmed.pop_back();
         }
         msg.text = trimmed;
 
         // Identify system messages versus regular user broadcasts
-        if (trimmed.rfind("[System]", 0) == 0 || 
+        if (trimmed.rfind(protocol::PREFIX_SYSTEM, 0) == 0 || 
             trimmed.rfind("[Notice]", 0) == 0 || 
             trimmed.rfind("[Server]", 0) == 0 || 
             trimmed.rfind("***", 0) == 0) {

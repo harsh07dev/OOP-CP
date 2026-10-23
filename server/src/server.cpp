@@ -2,6 +2,7 @@
 // Handles TCP socket creation, binding, listening, and concurrent client handling with dedicated worker threads.
 
 #include "server.h"
+#include "protocol.h"
 
 #include <iostream>
 #include <cstring>
@@ -127,7 +128,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
             size_t newlinePos;
             bool shouldExit = false;
 
-            while ((newlinePos = receiveBuffer.find('\n')) != std::string::npos) {
+            while ((newlinePos = receiveBuffer.find(protocol::DELIMITER)) != std::string::npos) {
                 std::string line = receiveBuffer.substr(0, newlinePos);
                 receiveBuffer.erase(0, newlinePos + 1);
 
@@ -151,7 +152,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                         m_logger.info("User joined: " + registeredUsername);
 
                         // Broadcast join notification to all other connected clients
-                        std::string joinNotification = "[System] " + registeredUsername + " has joined the chat.\n";
+                        std::string joinNotification = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat." + protocol::DELIMITER;
                         m_clientManager.broadcastMessage(joinNotification, clientSocket);
                     } else {
                         m_logger.error("Failed to register client: " + registeredUsername + " (" + clientEndpoint + ")");
@@ -162,7 +163,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                 }
 
                 // Handle graceful disconnect command (/quit)
-                if (line == "/quit") {
+                if (line == protocol::CMD_QUIT) {
                     userRequestedQuit = true;
                     shouldExit = true;
                     break;
@@ -172,7 +173,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                 m_logger.chat("[" + registeredUsername + "]: " + line);
 
                 // Broadcast chat message to all other connected clients
-                std::string chatMessage = "[" + registeredUsername + "]: " + line + "\n";
+                std::string chatMessage = "[" + registeredUsername + "]: " + line + protocol::DELIMITER;
                 m_clientManager.broadcastMessage(chatMessage, clientSocket);
             }
 
@@ -207,7 +208,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
         }
 
         // Broadcast leave notification to all remaining connected clients
-        std::string leaveNotification = "[System] " + departingUser + " has left the chat.\n";
+        std::string leaveNotification = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat." + protocol::DELIMITER;
         m_clientManager.broadcastMessage(leaveNotification, clientSocket);
     }
 

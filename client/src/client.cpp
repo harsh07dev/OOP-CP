@@ -2,6 +2,7 @@
 // Handles TCP socket creation, connecting to server, sending/receiving raw network data, and graceful shutdown.
 
 #include "client.h"
+#include "protocol.h"
 
 #include <iostream>
 #include <sstream>
@@ -178,8 +179,8 @@ bool Client::send_message(const std::string& message) {
         return false;
     }
     std::string wire_data = message;
-    if (wire_data.empty() || wire_data.back() != '\n') {
-        wire_data.push_back('\n');
+    if (wire_data.empty() || wire_data.back() != protocol::DELIMITER) {
+        wire_data.push_back(protocol::DELIMITER);
     }
     return send_raw(wire_data);
 }

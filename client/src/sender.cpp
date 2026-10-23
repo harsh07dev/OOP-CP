@@ -4,6 +4,7 @@
 #include "sender.h"
 #include "client.h"
 #include "protocol_handler.h"
+#include "protocol.h"
 
 #include <iostream>
 
@@ -33,7 +34,7 @@ void Sender::start() {
         }
 
         // Handle /quit command
-        if (line == "/quit") {
+        if (line == protocol::CMD_QUIT) {
             std::cout << "\n[Notice] Disconnecting from server..." << std::endl;
             client_.send_raw(ProtocolHandler::format_leave());
             client_.disconnect();

@@ -5,6 +5,7 @@
 #include "sender.h"
 #include "receiver.h"
 #include "protocol_handler.h"
+#include "protocol.h"
 #include "thread_compat.h"
 
 #include <iostream>
@@ -53,7 +54,7 @@ int main() {
     std::cout << "Connected successfully!" << std::endl << std::endl;
     std::cout << "----------------------------------------" << std::endl;
     std::cout << "Type your message below." << std::endl;
-    std::cout << "Use /quit to exit." << std::endl;
+    std::cout << "Use " << protocol::CMD_QUIT << " to exit." << std::endl;
     std::cout << "----------------------------------------" << std::endl << std::endl;
 
     // Send username registration according to protocol
