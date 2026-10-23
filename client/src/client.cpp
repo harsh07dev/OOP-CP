@@ -96,6 +96,7 @@ bool Client::connect_to_server(const std::string& ip, int port) {
     if (is_connected_) {
         disconnect();
     }
+    receive_buffer_.clear();
 
     if (!init_platform_networking()) {
         return false;
@@ -223,4 +224,30 @@ int Client::receive_raw(char* buffer, size_t buffer_size) {
     }
 
     return bytes_received;
+}
+
+bool Client::receive_line(std::string& out_line) {
+    while (is_connected_) {
+        // Check if internal receive_buffer_ already contains a complete line
+        size_t newline_pos = receive_buffer_.find(protocol::DELIMITER);
+        if (newline_pos != std::string::npos) {
+            out_line = receive_buffer_.substr(0, newline_pos);
+            receive_buffer_.erase(0, newline_pos + 1);
+            if (!out_line.empty() && out_line.back() == '\r') {
+                out_line.pop_back();
+            }
+            return true;
+        }
+
+        // Need more bytes from network
+        constexpr size_t CHUNK_SIZE = 1024;
+        char chunk[CHUNK_SIZE];
+        int bytes_read = receive_raw(chunk, sizeof(chunk));
+        if (bytes_read <= 0) {
+            return false;
+        }
+
+        receive_buffer_.append(chunk, static_cast<size_t>(bytes_read));
+    }
+    return false;
 }

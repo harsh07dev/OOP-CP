@@ -20,6 +20,13 @@ struct ClientInfo {
     sockaddr_in address{};
 };
 
+enum class RegistrationResult {
+    SUCCESS,
+    DUPLICATE_USERNAME,
+    INVALID_USERNAME,
+    SOCKET_ALREADY_REGISTERED
+};
+
 class Logger;
 
 class ClientManager {
@@ -34,7 +41,13 @@ public:
     // Configure logger reference for broadcast error reporting
     void setLogger(Logger* logger);
 
-    // Thread-safe registration of a new client
+    // Thread-safe atomic validation, duplicate check (case-insensitive), and registration
+    RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address);
+
+    // Thread-safe check if a username is currently taken (case-insensitive)
+    bool isUsernameTaken(const std::string& username) const;
+
+    // Thread-safe registration of a new client (delegates to registerClient)
     bool addClient(SOCKET socket, const std::string& username, const sockaddr_in& address);
 
     // Thread-safe removal of a client by socket handle

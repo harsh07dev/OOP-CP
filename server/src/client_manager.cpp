@@ -3,10 +3,28 @@
 
 #include "client_manager.h"
 #include "logger.h"
+#include "protocol.h"
 
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <cctype>
+#include <string_view>
+
+namespace {
+    bool equalsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                std::tolower(static_cast<unsigned char>(b[i]))) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
 
 ClientManager::ClientManager(Logger* logger)
     : m_logger(logger)
@@ -27,16 +45,39 @@ std::string ClientManager::formatEndpoint(const sockaddr_in& addr) {
     return std::string(ipBuffer) + ":" + std::to_string(port);
 }
 
-bool ClientManager::addClient(SOCKET socket, const std::string& username, const sockaddr_in& address) {
+bool ClientManager::isUsernameTaken(const std::string& username) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& client : m_clients) {
+        if (equalsIgnoreCase(client.username, username)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+RegistrationResult ClientManager::registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // Verify socket is not already registered
+    // 1. Verify socket is not already registered
     for (const auto& client : m_clients) {
         if (client.socket == socket) {
-            return false;
+            return RegistrationResult::SOCKET_ALREADY_REGISTERED;
         }
     }
 
+    // 2. Validate username format (length, character set, no newlines/control chars)
+    if (!protocol::isValidUsername(username)) {
+        return RegistrationResult::INVALID_USERNAME;
+    }
+
+    // 3. Case-insensitive duplicate username check
+    for (const auto& client : m_clients) {
+        if (equalsIgnoreCase(client.username, username)) {
+            return RegistrationResult::DUPLICATE_USERNAME;
+        }
+    }
+
+    // 4. Atomically insert client
     ClientInfo info;
     info.socket = socket;
     info.username = username;
@@ -45,7 +86,11 @@ bool ClientManager::addClient(SOCKET socket, const std::string& username, const 
 
     std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
 
-    return true;
+    return RegistrationResult::SUCCESS;
+}
+
+bool ClientManager::addClient(SOCKET socket, const std::string& username, const sockaddr_in& address) {
+    return registerClient(socket, username, address) == RegistrationResult::SUCCESS;
 }
 
 bool ClientManager::removeClient(SOCKET socket) {

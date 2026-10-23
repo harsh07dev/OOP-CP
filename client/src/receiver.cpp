@@ -18,15 +18,12 @@ Receiver::~Receiver() {
 
 void Receiver::start() {
     is_running_ = true;
-    char buffer[4096];
+    std::string line;
 
     while (is_running_ && client_.is_connected()) {
-        int bytes_received = client_.receive_raw(buffer, sizeof(buffer) - 1);
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-
+        if (client_.receive_line(line)) {
             // Parse incoming payload through the protocol handler
-            ClientMessage msg = ProtocolHandler::parse(std::string(buffer, bytes_received));
+            ClientMessage msg = ProtocolHandler::parse(line);
 
             // Print incoming message cleanly and restore prompt
             std::cout << "\r";
@@ -36,16 +33,10 @@ void Receiver::start() {
                 std::cout << msg.text << "\n";
             }
             std::cout << "> " << std::flush;
-        } else if (bytes_received == 0) {
+        } else {
+            // Connection closed or error occurred
             if (is_running_) {
                 std::cout << "\n[Notice] Server disconnected. Press Enter to exit." << std::endl;
-                client_.disconnect();
-            }
-            break;
-        } else {
-            // Receive error occurred (connection lost / reset)
-            if (is_running_ && client_.is_connected()) {
-                std::cerr << "\n[Error] Connection error with server. Press Enter to exit." << std::endl;
                 client_.disconnect();
             }
             break;

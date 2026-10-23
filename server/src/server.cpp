@@ -139,26 +139,48 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
 
                 // First message must be interpreted as username registration
                 if (!isRegistered) {
-                    if (line.empty()) {
-                        m_logger.warning("Client registration rejected: empty username (" + clientEndpoint + ")");
+                    RegistrationResult res = m_clientManager.registerClient(clientSocket, line, clientAddr);
+
+                    if (res == RegistrationResult::INVALID_USERNAME) {
+                        m_logger.warning("Client registration rejected: invalid username '" + line + "' (" + clientEndpoint + ")");
+                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                        shouldExit = true;
+                        break;
+                    }
+                    else if (res == RegistrationResult::DUPLICATE_USERNAME) {
+                        m_logger.warning("Client registration rejected: duplicate username '" + line + "' (" + clientEndpoint + ")");
+                        std::string resp = std::string(protocol::RESP_ERR_USERNAME_TAKEN) + protocol::DELIMITER;
+                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                        shouldExit = true;
+                        break;
+                    }
+                    else if (res != RegistrationResult::SUCCESS) {
+                        m_logger.error("Failed to register client: " + line + " (" + clientEndpoint + ")");
+                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
                         shouldExit = true;
                         break;
                     }
 
+                    // Registration succeeded
+                    isRegistered = true;
                     registeredUsername = line;
-                    if (m_clientManager.addClient(clientSocket, registeredUsername, clientAddr)) {
-                        isRegistered = true;
-                        m_logger.info("User registered: " + registeredUsername + " (" + clientEndpoint + ")");
-                        m_logger.info("User joined: " + registeredUsername);
+                    m_logger.info("User registered: " + registeredUsername + " (" + clientEndpoint + ")");
+                    m_logger.info("User joined: " + registeredUsername);
 
-                        // Broadcast join notification to all other connected clients
-                        std::string joinNotification = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat." + protocol::DELIMITER;
-                        m_clientManager.broadcastMessage(joinNotification, clientSocket);
-                    } else {
-                        m_logger.error("Failed to register client: " + registeredUsername + " (" + clientEndpoint + ")");
+                    // Send OK acknowledgement directly to the registering client
+                    std::string okResp = std::string(protocol::RESP_OK) + protocol::DELIMITER;
+                    if (!ClientManager::sendAll(clientSocket, okResp, registeredUsername, &m_logger)) {
+                        m_logger.error("Failed to send OK response to " + registeredUsername);
                         shouldExit = true;
                         break;
                     }
+
+                    // Broadcast join notification to all other connected clients
+                    std::string joinNotification = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat." + protocol::DELIMITER;
+                    m_clientManager.broadcastMessage(joinNotification, clientSocket);
+
                     continue; // First message handled; proceed to next line or next recv
                 }
 

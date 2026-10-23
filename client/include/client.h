@@ -62,6 +62,7 @@ public:
     bool send_message(const std::string& message);
     bool send_raw(const std::string& data);
     int receive_raw(char* buffer, size_t buffer_size);
+    bool receive_line(std::string& out_line);
 
 private:
     std::string server_ip_;
@@ -69,6 +70,7 @@ private:
     std::string username_;
     socket_handle_t socket_fd_;
     std::atomic<bool> is_connected_;
+    std::string receive_buffer_;
 
     bool init_platform_networking();
     void cleanup_platform_networking();
