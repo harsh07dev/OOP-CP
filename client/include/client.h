@@ -31,6 +31,7 @@
 #include <string>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 class Client {
 public:
@@ -71,6 +72,8 @@ private:
     socket_handle_t socket_fd_;
     std::atomic<bool> is_connected_;
     std::string receive_buffer_;
+    mutable std::mutex socket_mutex_;
+    std::atomic<bool> wsa_initialized_{false};
 
     bool init_platform_networking();
     void cleanup_platform_networking();

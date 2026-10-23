@@ -55,7 +55,7 @@ bool ClientManager::isUsernameTaken(const std::string& username) const {
     return false;
 }
 
-RegistrationResult ClientManager::registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address) {
+RegistrationResult ClientManager::registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     // 1. Verify socket is not already registered
@@ -82,6 +82,9 @@ RegistrationResult ClientManager::registerClient(SOCKET socket, const std::strin
     info.socket = socket;
     info.username = username;
     info.address = address;
+    if (isClosed) {
+        info.isClosed = isClosed;
+    }
     m_clients.push_back(info);
 
     std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
@@ -94,20 +97,50 @@ bool ClientManager::addClient(SOCKET socket, const std::string& username, const 
 }
 
 bool ClientManager::removeClient(SOCKET socket) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::shared_ptr<std::mutex> sMutex;
+    std::shared_ptr<std::atomic<bool>> sClosed;
 
-    auto it = std::find_if(m_clients.begin(), m_clients.end(), [socket](const ClientInfo& info) {
-        return info.socket == socket;
-    });
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (it != m_clients.end()) {
-        m_clients.erase(it);
+        auto it = std::find_if(m_clients.begin(), m_clients.end(), [socket](const ClientInfo& info) {
+            return info.socket == socket;
+        });
 
-        std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
-        return true;
+        if (it != m_clients.end()) {
+            sMutex = it->sendMutex;
+            sClosed = it->isClosed;
+            m_clients.erase(it);
+
+            std::cout << "Active clients: " << m_clients.size() << std::endl << std::endl;
+        }
     }
 
-    return false;
+    if (sClosed) {
+        sClosed->store(true);
+    }
+
+    return (sClosed != nullptr);
+}
+
+void ClientManager::closeAllClients() {
+    std::vector<ClientInfo> clientsCopy;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        clientsCopy = m_clients;
+        m_clients.clear();
+        std::cout << "Active clients: 0" << std::endl << std::endl;
+    }
+
+    for (auto& client : clientsCopy) {
+        if (client.sendMutex && client.isClosed) {
+            std::lock_guard<std::mutex> lock(*client.sendMutex);
+            if (!client.isClosed->exchange(true)) {
+                shutdown(client.socket, SD_BOTH);
+                closesocket(client.socket);
+            }
+        }
+    }
 }
 
 size_t ClientManager::getClientCount() const {
@@ -148,9 +181,34 @@ void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSo
         }
     }
 
-    // Perform socket send operations outside the mutex lock
+    std::vector<SOCKET> deadSockets;
+
+    // Perform socket send operations outside the global lock, serialized per client
     for (const auto& target : targets) {
-        sendAll(target.socket, message, target.username, logger);
+        if (!target.sendMutex || !target.isClosed) {
+            continue;
+        }
+
+        std::lock_guard<std::mutex> sendLock(*target.sendMutex);
+        if (target.isClosed->load()) {
+            continue; // Skip already closed socket safely
+        }
+
+        bool success = sendAll(target.socket, message, target.username, logger);
+        if (!success) {
+            if (!target.isClosed->exchange(true)) {
+                shutdown(target.socket, SD_BOTH);
+                closesocket(target.socket);
+            }
+            deadSockets.push_back(target.socket);
+        }
+    }
+
+    // Evict any dead sockets that failed during broadcast
+    if (!deadSockets.empty()) {
+        for (SOCKET s : deadSockets) {
+            removeClient(s);
+        }
     }
 }
 

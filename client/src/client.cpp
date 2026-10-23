@@ -22,6 +22,7 @@ Client::Client()
 
 Client::~Client() {
     disconnect();
+    cleanup_platform_networking();
 }
 
 void Client::set_server_info(const std::string& ip, int port) {
@@ -47,11 +48,14 @@ const std::string& Client::get_username() const {
 
 bool Client::init_platform_networking() {
 #ifdef _WIN32
-    WSADATA wsa_data;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsa_data);
-    if (result != 0) {
-        std::cerr << "[Error] WSAStartup failed with error: " << result << std::endl;
-        return false;
+    if (!wsa_initialized_) {
+        WSADATA wsa_data;
+        int result = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        if (result != 0) {
+            std::cerr << "[Error] WSAStartup failed with error: " << result << std::endl;
+            return false;
+        }
+        wsa_initialized_ = true;
     }
 #endif
     return true;
@@ -59,14 +63,20 @@ bool Client::init_platform_networking() {
 
 void Client::cleanup_platform_networking() {
 #ifdef _WIN32
-    WSACleanup();
+    if (wsa_initialized_.exchange(false)) {
+        WSACleanup();
+    }
 #endif
 }
 
 void Client::close_socket_handle() {
-    socket_handle_t sock = socket_fd_;
-    if (sock != INVALID_SOCKET_HANDLE) {
+    socket_handle_t sock = INVALID_SOCKET_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        sock = socket_fd_;
         socket_fd_ = INVALID_SOCKET_HANDLE;
+    }
+    if (sock != INVALID_SOCKET_HANDLE) {
 #ifdef _WIN32
         shutdown(sock, SD_BOTH);
         closesocket(sock);
@@ -125,21 +135,29 @@ bool Client::connect_to_server(const std::string& ip, int port) {
     bool connected = false;
     std::string last_error = "No route to host";
     for (struct addrinfo* ptr = addr_result; ptr != nullptr; ptr = ptr->ai_next) {
-        // Step 1: Create TCP socket
-        socket_fd_ = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-        if (socket_fd_ == INVALID_SOCKET_HANDLE) {
+        socket_handle_t temp_sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (temp_sock == INVALID_SOCKET_HANDLE) {
             last_error = get_socket_error_message();
             continue;
         }
 
-        // Step 2: Connect socket to remote server endpoint
-        int conn_res = connect(socket_fd_, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen));
+        int conn_res = connect(temp_sock, ptr->ai_addr, static_cast<int>(ptr->ai_addrlen));
         if (conn_res == SOCKET_CALL_ERROR) {
             last_error = get_socket_error_message();
-            close_socket_handle();
+#ifdef _WIN32
+            shutdown(temp_sock, SD_BOTH);
+            closesocket(temp_sock);
+#else
+            shutdown(temp_sock, SD_BOTH);
+            close(temp_sock);
+#endif
             continue;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            socket_fd_ = temp_sock;
+        }
         connected = true;
         break;
     }
@@ -150,7 +168,6 @@ bool Client::connect_to_server(const std::string& ip, int port) {
         std::cerr << "[Error] Connection failed to " << ip << ":" << port 
                   << " - " << last_error << std::endl;
         close_socket_handle();
-        cleanup_platform_networking();
         is_connected_ = false;
         return false;
     }
@@ -160,11 +177,8 @@ bool Client::connect_to_server(const std::string& ip, int port) {
 }
 
 void Client::disconnect() {
-    bool was_connected = is_connected_.exchange(false);
-    if (was_connected || socket_fd_ != INVALID_SOCKET_HANDLE) {
-        close_socket_handle();
-        cleanup_platform_networking();
-    }
+    is_connected_ = false;
+    close_socket_handle();
 }
 
 bool Client::is_connected() const {
@@ -172,6 +186,7 @@ bool Client::is_connected() const {
 }
 
 socket_handle_t Client::get_socket() const {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
     return socket_fd_;
 }
 
@@ -183,11 +198,22 @@ bool Client::send_message(const std::string& message) {
     if (wire_data.empty() || wire_data.back() != protocol::DELIMITER) {
         wire_data.push_back(protocol::DELIMITER);
     }
+    if (wire_data.size() > protocol::MAX_MESSAGE_SIZE) {
+        std::cerr << "[Error] Cannot send message: size (" << wire_data.size()
+                  << " bytes) exceeds MAX_MESSAGE_SIZE (" << protocol::MAX_MESSAGE_SIZE << ")." << std::endl;
+        return false;
+    }
     return send_raw(wire_data);
 }
 
 bool Client::send_raw(const std::string& data) {
-    if (!is_connected_ || socket_fd_ == INVALID_SOCKET_HANDLE) {
+    socket_handle_t sock = INVALID_SOCKET_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        sock = socket_fd_;
+    }
+
+    if (!is_connected_ || sock == INVALID_SOCKET_HANDLE) {
         return false;
     }
 
@@ -195,11 +221,11 @@ bool Client::send_raw(const std::string& data) {
     size_t bytes_to_send = data.size();
 
     while (total_sent < bytes_to_send) {
-        int bytes_sent = send(socket_fd_, data.data() + total_sent, 
+        int bytes_sent = send(sock, data.data() + total_sent, 
                               static_cast<int>(bytes_to_send - total_sent), 0);
         if (bytes_sent == SOCKET_CALL_ERROR) {
             std::cerr << "[Error] Send failed: " << get_socket_error_message() << std::endl;
-            is_connected_ = false;
+            disconnect();
             return false;
         }
         total_sent += static_cast<size_t>(bytes_sent);
@@ -209,17 +235,23 @@ bool Client::send_raw(const std::string& data) {
 }
 
 int Client::receive_raw(char* buffer, size_t buffer_size) {
-    if (!is_connected_ || socket_fd_ == INVALID_SOCKET_HANDLE) {
+    socket_handle_t sock = INVALID_SOCKET_HANDLE;
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        sock = socket_fd_;
+    }
+
+    if (!is_connected_ || sock == INVALID_SOCKET_HANDLE) {
         return -1;
     }
 
-    int bytes_received = recv(socket_fd_, buffer, static_cast<int>(buffer_size), 0);
+    int bytes_received = recv(sock, buffer, static_cast<int>(buffer_size), 0);
     if (bytes_received == 0) {
         // Server closed connection gracefully
-        is_connected_ = false;
+        disconnect();
         return 0;
     } else if (bytes_received == SOCKET_CALL_ERROR) {
-        is_connected_ = false;
+        disconnect();
         return -1;
     }
 
@@ -231,12 +263,29 @@ bool Client::receive_line(std::string& out_line) {
         // Check if internal receive_buffer_ already contains a complete line
         size_t newline_pos = receive_buffer_.find(protocol::DELIMITER);
         if (newline_pos != std::string::npos) {
+            size_t wire_size = newline_pos + 1;
             out_line = receive_buffer_.substr(0, newline_pos);
             receive_buffer_.erase(0, newline_pos + 1);
             if (!out_line.empty() && out_line.back() == '\r') {
                 out_line.pop_back();
             }
+
+            // Discard oversized message line safely
+            if (wire_size > protocol::MAX_MESSAGE_SIZE) {
+                std::cerr << "[Warning] Discarded oversized incoming line (" << wire_size
+                          << " bytes, limit is " << protocol::MAX_MESSAGE_SIZE << ")." << std::endl;
+                continue;
+            }
+
             return true;
+        }
+
+        // Bound incoming line accumulation: prevent buffer from growing unbounded without newline
+        if (receive_buffer_.size() > protocol::MAX_MESSAGE_SIZE) {
+            std::cerr << "[Error] Incoming data stream exceeded MAX_MESSAGE_SIZE without delimiter ("
+                      << receive_buffer_.size() << " bytes). Disconnecting." << std::endl;
+            disconnect();
+            return false;
         }
 
         // Need more bytes from network

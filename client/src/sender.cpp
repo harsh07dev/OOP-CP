@@ -41,14 +41,24 @@ void Sender::start() {
             break;
         }
 
-        // Send non-empty message formatted via protocol
-        if (!line.empty()) {
-            std::string payload = ProtocolHandler::format_chat(line);
-            if (!client_.send_raw(payload)) {
-                std::cerr << "\n[Error] Failed to send message: connection lost." << std::endl;
-                client_.disconnect();
-                break;
-            }
+        // Reject empty messages
+        if (line.empty()) {
+            continue;
+        }
+
+        // Validate message size before sending (wire size including newline must not exceed MAX_MESSAGE_SIZE)
+        if (line.size() + 1 > protocol::MAX_MESSAGE_SIZE) {
+            std::cout << "[Warning] Message too long (" << (line.size() + 1)
+                      << " bytes). Max allowed is " << protocol::MAX_MESSAGE_SIZE
+                      << " bytes. Message was not sent." << std::endl;
+            continue;
+        }
+
+        std::string payload = ProtocolHandler::format_chat(line);
+        if (!client_.send_raw(payload)) {
+            std::cerr << "\n[Error] Failed to send message: connection lost." << std::endl;
+            client_.disconnect();
+            break;
         }
     }
 
