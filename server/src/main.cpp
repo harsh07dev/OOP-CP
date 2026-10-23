@@ -7,6 +7,13 @@
 #include <iostream>
 #include <csignal>
 
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
+
 namespace {
     Server* g_serverInstance = nullptr;
 
@@ -17,12 +24,28 @@ namespace {
             }
         }
     }
+
+#ifdef _WIN32
+    BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
+        if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
+            if (g_serverInstance != nullptr) {
+                g_serverInstance->stop();
+            }
+            return TRUE;
+        }
+        return FALSE;
+    }
+#endif
 }
 
 int main() {
     // Register signal handlers for clean termination on SIGINT (Ctrl+C) and SIGTERM
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+
+#ifdef _WIN32
+    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+#endif
 
     constexpr int SERVER_PORT = 8080;
 

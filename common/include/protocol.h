@@ -15,7 +15,8 @@ namespace protocol {
 inline constexpr char DELIMITER = '\n';
 inline constexpr std::string_view DELIMITER_STR = "\n";
 
-// Maximum permitted message size in bytes across the wire
+// Maximum permitted message size in bytes across the wire, including the trailing delimiter ('\n').
+// Maximum payload text length is MAX_MESSAGE_SIZE - 1 bytes (2047 bytes).
 inline constexpr std::size_t MAX_MESSAGE_SIZE = 2048;
 
 // Maximum permitted username length in characters

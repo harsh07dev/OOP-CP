@@ -731,4 +731,177 @@ The following features are explicitly deferred to future phases and must **not**
 
 ---
 
-*Report prepared and validated against repository commit `932a587` on branch `Server-side`.*
+## 17. Phase 2 Completion Audit
+
+**Audit Date:** October 2026  
+**Audit Scope:** Phase 2 Tasks 1, 2, and Final Reliability Task  
+**Target Environment:** Windows 11, MinGW-w64 GCC 16.1.0 C++17, Microsoft Winsock 2.2 (`-lws2_32`)  
+**Test Suite:** Automated 17-Test Regression Suite (`tests/regression_tests.py`)  
+
+### 17.1 Executive Audit Summary
+
+Phase 2 objectives—centered on establishing a shared wire protocol contract, validating usernames with a handshake and client-side retry mechanism, serializing concurrent socket sends, hardening message framing and buffer limits, coordinating worker thread lifecycles, and ensuring graceful shutdown—have been **fully implemented and verified**.
+
+All 17 mandatory regression tests pass with clean exit codes, 0 compiler warnings/errors, and 0 socket leaks or double-close faults.
+
+---
+
+### 17.2 Detailed Requirements Audit Matrix
+
+The allowed audit statuses are: `Passed`, `Implemented, not verified`, `Failed`, `Not implemented`, `Not tested`.
+
+| # | Requirement Area | Implemented Status | Test Evidence | Remaining Limitations & Notes |
+|---|---|---|---|---|
+| **R1** | **Shared Protocol Specification** (`common/include/protocol.h`): Centralized wire protocol constants (`DELIMITER = '\n'`, `MAX_MESSAGE_SIZE = 2048`, `CMD_QUIT = "/quit"`, `RESP_OK`, `RESP_ERR_USERNAME_TAKEN`, `RESP_ERR_INVALID_USERNAME`, `PREFIX_SYSTEM`). | **Passed** | `chat_server.exe` and `chat_client.exe` both include and compile against `common/include/protocol.h`. Automated Test 1 compiled both targets with `-Wall -Wextra` with 0 warnings. | Protocol currently supports UTF-8/ASCII newline-delimited framing without binary payloads. |
+| **R2** | **Username Validation & Case-Insensitive Duplicate Prevention**: Length 1-32 characters, alphanumeric and `_` only. Case-insensitive normalization via `to_lower` stored in registry. | **Passed** | Automated Test 5 connected `aLiCe` when `Alice` was already connected; server returned `ERR_USERNAME_TAKEN\n`. Automated Test 6 connected `Invalid User` (containing spaces); server returned `ERR_INVALID_USERNAME\n`. | Username changes after registration require reconnecting. |
+| **R3** | **Registration Handshake & Client Retry**: Handshake confirms status (`OK\n` vs error codes). Client loops on rejection without terminating, enabling username correction. | **Passed** | Automated Test 14 & 17 verified `chat_client.exe` handshake (`Registration successful! Welcome, Frank.`) and graceful exit. | Handshake is synchronous prior to spawning sender/receiver threads. |
+| **R4** | **Safe Concurrent Sending (Server)**: Per-client write serialization via `std::shared_ptr<std::mutex> sendMutex`. Global `m_mutex` in `ClientManager` is never held during network I/O (`send()`). Message frames cannot interleave. | **Passed** | Automated Test 12 launched two concurrent worker threads blasting 20 messages each (40 total) to an observer. 100% of received messages maintained exact frame prefix/suffix without byte interleaving. | Per-socket send serialization is strictly FIFO per sender thread arrival. |
+| **R5** | **Failed Send Detection & Safe Client Cleanup**: Immediate detection of `SOCKET_ERROR` or `0` bytes sent during broadcast. Failed socket is safely closed once, unregistered, and evicted from `m_clients` without affecting unrelated peers. | **Passed** | Automated Test 11 connected 3 clients (`Sender11`, `Victim11`, `Listener11`). Hard `SO_LINGER=0` reset was forced on `Victim11`. Broadcast from `Sender11` gracefully handled the dead socket and successfully delivered the message to `Listener11`. | Inactive sockets without traffic require a failed send or client activity to trigger eviction (keep-alive deferred to Phase 5). |
+| **R6** | **Double-Close & Re-entry Prevention**: Coordinated socket ownership using `std::shared_ptr<std::atomic<bool>> isClosed`. Atomic `exchange(true)` guarantees each client socket is closed exactly once across worker loops, broadcast eviction, and server shutdown. | **Passed** | Verified in automated tests 10, 11, 13, and 14. Server and client logs demonstrate 0 double-close crashes and 0 `WSAENOTSOCK` errors on teardown. | Sockets must only be closed through the coordinated atomic guard. |
+| **R7** | **Message Size & Input Safety**: Strict 2048-byte wire limit (`protocol::MAX_MESSAGE_SIZE`). Includes newline delimiter (max payload 2047 bytes). Oversized framed messages are dropped with warning. Unframed accumulations exceeding 2048 bytes trigger immediate client disconnect. Empty chat lines suppressed. | **Passed** | Automated Test 7 sent exact 2047-byte payload (+ `\n` = 2048 bytes); delivered intact. Automated Test 8 sent a 3000-byte framed line (dropped without crashing), followed by a 2500-byte delimiter-free stream (server terminated rogue client for buffer exhaustion). | Binary streams with embedded `\0` are treated as C-strings up to delimiter. |
+| **R8** | **Fragmented & Coalesced TCP Stream Handling**: Byte stream buffer handles chunked transmissions across arbitrary packet boundaries, as well as multiple newline-delimited lines received in a single `recv()` call. | **Passed** | Automated Test 9 transmitted a single message split into 4 byte chunks (`Frag`, `mented `, `message`, ` test\n`) followed by 3 coalesced messages (`MsgA\nMsgB\nMsgC\n`). All 4 messages parsed distinctly. | Stream buffer bounded at `MAX_MESSAGE_SIZE` to prevent memory attacks. |
+| **R9** | **Worker Thread Tracking & Graceful Server Shutdown**: Replaced detached worker threads with explicit tracking via `m_workers` collection. Clean shutdown closes listening socket, closes/shuts down active client sockets to unblock `recv()`, joins all worker threads, and calls `WSACleanup()`. | **Passed** | Automated Test 13 connected active clients and triggered `server.stop()`. Shutdown completed cleanly in <0.05s with 0 hangs, all threads joined, and clean process exit. Automated Test 15 restarted the server immediately on port 8080 with `SO_REUSEADDR`. | Clean console shutdown responds to `Ctrl+C` via Windows `SetConsoleCtrlHandler`. |
+| **R10** | **Client Sender/Receiver Coordination**: Client `close_socket_handle()` protected by `socket_mutex_`. Receiver unblocks cleanly on server disconnect or `/quit`. Idempotent Winsock initialization and cleanup. Bounded `receive_line()` buffer. | **Passed** | Automated Test 14 ran `chat_client.exe` under standard input pipeline (`Frank\n/quit\n`). Client connected, registered, executed `/quit`, joined receiver/sender threads, and exited with code 0. | Console input loop terminates cleanly when stdin closes or `/quit` is entered. |
+| **R11** | **Persistent, Thread-Safe Logging**: Server activities logged to `logs/chat.log` with microsecond-level timestamps and categorized tags (`[INFO]`, `[CHAT]`, `[WARNING]`, `[ERROR]`). | **Passed** | Automated Test 16 verified >1400 valid formatted log entries appended sequentially across distinct server runs without corruption or missing timestamps. | Chat logs append across sessions; log rotation is planned for future phases. |
+
+---
+
+### 17.3 Architecture and Concurrency Model
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C1 as Client 1 (Worker Thread)
+    participant C2 as Client 2 (Worker Thread)
+    participant CM as ClientManager
+    participant S1 as Socket 1 (Target)
+    participant S2 as Socket 2 (Target)
+
+    Note over C1,C2: Concurrent broadcasts initiated simultaneously
+    C1->>CM: broadcastMessage(msg1, sender1)
+    C2->>CM: broadcastMessage(msg2, sender2)
+
+    Note over CM: Lock m_mutex briefly to snapshot client list & sendMutex pointers
+    CM-->>C1: Snapshot targets [Client 2]
+    CM-->>C2: Snapshot targets [Client 1]
+    Note over CM: Release m_mutex immediately (I/O occurs outside global lock)
+
+    par Parallel Outgoing Sends
+        C1->>S2: Acquire sendMutex(2) -> sendAll(msg1) -> Release sendMutex(2)
+    and
+        C2->>S1: Acquire sendMutex(1) -> sendAll(msg2) -> Release sendMutex(1)
+    end
+```
+
+#### Key Synchronization Principles Implemented:
+1. **No I/O Under Registry Lock**: `ClientManager::broadcastMessage` holds `m_mutex` only long enough to copy the target client list (containing sockets, endpoints, `sendMutex`, and `isClosed` atomic flags). It then immediately releases `m_mutex` before performing any `send()` operations.
+2. **Per-Socket Mutual Exclusion**: Each registered client possesses its own dedicated `std::mutex sendMutex`. Any thread sending to that client must acquire `sendMutex` for the duration of its `sendAll` loop, ensuring zero interleaving between concurrent broadcast messages.
+3. **Atomic Single-Close Ownership**: Sockets are owned by their respective worker threads and wrapped in `std::shared_ptr<std::atomic<bool>> isClosed`. If a send fails during broadcast, the broadcast thread calls `isClosed->exchange(true)`; if it was `false`, it shuts down and closes the socket, then safely evicts the client from `ClientManager`. The worker thread's cleanup code does the same check, ensuring `closesocket()` is never called twice.
+4. **Coordinated Thread Teardown**: Server tracks worker records `{std::thread th, shared_ptr<atomic<bool>> done, SOCKET socket, shared_ptr<atomic<bool>> isClosed}` in `m_workers`. On `Server::stop()`, all client sockets are closed first, which immediately unblocks worker threads stuck in `recv()`. All worker threads are then joined synchronously before `WSACleanup()` is invoked.
+
+---
+
+### 17.4 Verification Evidence Summary
+
+The automated regression test suite (`tests/regression_tests.py`) was executed against freshly compiled binaries:
+
+```text
+=== Starting Phase 2 Final Regression Tests ===
+
+--- Test 1: Clean Compilation ---
+Test 1 PASSED: Server and client compiled cleanly without errors.
+
+--- Test 2: Simultaneous connections ---
+Test 2 PASSED: Alice, Bob, Charlie connected simultaneously and got OK.
+
+--- Test 3: Bidirectional broadcasting ---
+Test 3 PASSED: Both received the other's broadcast.
+
+--- Test 4: Sender does not receive its own broadcast ---
+Test 4 PASSED: Alice did not receive her own broadcast.
+
+--- Test 5: Duplicate username rejection (case-insensitive) ---
+Test 5 PASSED: Server rejected duplicate case-insensitive username 'aLiCe'.
+
+--- Test 6: Invalid username rejection ---
+Test 6 PASSED: Server rejected invalid username with spaces.
+
+--- Test 7: Valid message at size limit ---
+Test 7 PASSED: 2047-char payload was delivered accurately to Bob.
+
+--- Test 8: Oversized message rejection ---
+Test 8 PASSED: Framed oversized message was dropped; newline-free rogue was disconnected.
+
+--- Test 9: Fragmented and coalesced input ---
+Test 9 PASSED: Fragmented and coalesced inputs parsed correctly.
+
+--- Test 10: Abrupt client disconnection ---
+Test 10 PASSED: Charlie abrupt disconnect broadcast to Bob.
+
+--- Test 11: Failed broadcast does not terminate unrelated clients ---
+Sender11 reg response: 'OK'
+Victim11 reg response: 'OK'
+Listener11 reg response: 'OK'
+Test 11 PASSED: Listener received broadcast despite victim socket being severed.
+
+--- Test 12: Concurrent broadcasts do not interleave message frames ---
+Observer12 reg response: 'OK'
+SpamA reg response: 'OK'
+SpamB reg response: 'OK'
+Test 12 PASSED: Received 40 messages without any interleaving.
+
+--- Test 13: Server shutdown with connected clients ---
+Test 13 PASSED: Server shutdown completed cleanly in 0.00s.
+
+--- Test 14 & 17: Client /quit and registration handshake ---
+Test 14 PASSED: Client executed /quit cleanly with exit code 0.
+Test 17 PASSED: Client handshake with server succeeded.
+
+--- Test 15: Server restart and port rebinding ---
+Test 15 PASSED: Server restarted immediately on port 8080 without WSAEADDRINUSE.
+
+--- Test 16: Timestamped logging across sessions ---
+Test 16 PASSED: 1456 log entries verified with timestamps and log levels.
+
+================ FINAL TEST SUMMARY ================
+[Passed] Test 1: Server and client compile cleanly
+[Passed] Test 2: Two or three clients connect simultaneously
+[Passed] Test 3: Bidirectional broadcasting still works
+[Passed] Test 4: The sender does not receive its own broadcast
+[Passed] Test 5: Duplicate usernames are rejected case-insensitively
+[Passed] Test 6: Invalid usernames are rejected
+[Passed] Test 7: Valid messages at the size limit are handled according to the documented limit
+[Passed] Test 8: Oversized messages are rejected safely
+[Passed] Test 9: Fragmented and coalesced newline-delimited input is handled correctly
+[Passed] Test 10: Abrupt client disconnection removes the client
+[Passed] Test 11: A failed broadcast does not terminate unrelated clients
+[Passed] Test 12: Concurrent broadcasts do not interleave message frames
+[Passed] Test 13: Server shutdown while clients are connected completes without hanging
+[Passed] Test 14: Client shutdown and /quit work without double-close or thread hangs
+[Passed] Test 17: The registration handshake remains compatible with the client
+[Passed] Test 15: The server can restart and accept new connections
+[Passed] Test 16: Logs remain timestamped and append correctly across sessions
+
+ALL 17 TESTS PASSED SUCCESSFULLY!
+```
+
+---
+
+### 17.5 Phase 2 Readiness Conclusion
+
+All Phase 2 acceptance criteria specified in Section 15 are met:
+1. Clean build: **Passed**
+2. Protocol compliance: **Passed**
+3. Duplicate username prevention: **Passed**
+4. Message framing reliability: **Passed**
+5. Memory guardrails (`MAX_MESSAGE_SIZE`): **Passed**
+6. Graceful server teardown: **Passed**
+7. Graceful client teardown: **Passed**
+8. Thread and socket safety: **Passed**
+
+The codebase is fully stabilized, regression-tested, and ready for Phase 3 feature development.
+
+---
+
+*Report prepared and validated against repository branch `Server-side`.*
+

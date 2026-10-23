@@ -12,12 +12,16 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <memory>
+#include <atomic>
 
 // Structure holding connection and identity metadata for an active client
 struct ClientInfo {
     SOCKET socket{INVALID_SOCKET};
     std::string username;
     sockaddr_in address{};
+    std::shared_ptr<std::mutex> sendMutex{std::make_shared<std::mutex>()};
+    std::shared_ptr<std::atomic<bool>> isClosed{std::make_shared<std::atomic<bool>>(false)};
 };
 
 enum class RegistrationResult {
@@ -42,7 +46,7 @@ public:
     void setLogger(Logger* logger);
 
     // Thread-safe atomic validation, duplicate check (case-insensitive), and registration
-    RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address);
+    RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed = nullptr);
 
     // Thread-safe check if a username is currently taken (case-insensitive)
     bool isUsernameTaken(const std::string& username) const;
@@ -52,6 +56,9 @@ public:
 
     // Thread-safe removal of a client by socket handle
     bool removeClient(SOCKET socket);
+
+    // Thread-safe coordinated closure of all active clients (called on server shutdown)
+    void closeAllClients();
 
     // Thread-safe query of active client count
     size_t getClientCount() const;
