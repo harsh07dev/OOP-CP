@@ -72,6 +72,12 @@ public:
     // Thread-safe snapshot of all active clients
     std::vector<ClientInfo> getAllClients() const;
 
+    // Thread-safe snapshot of currently active registered usernames (without exposing sockets or endpoints)
+    std::vector<std::string> getOnlineUsernames() const;
+
+    // Thread-safe lookup of an active client by username (case-insensitive)
+    bool getClientByUsername(const std::string& username, ClientInfo& outInfo) const;
+
     // Thread-safe message broadcasting to all connected clients except senderSocket.
     // Snapshots recipients under the mutex and executes network send() calls outside the lock.
     void broadcastMessage(const std::string& message, SOCKET senderSocket = INVALID_SOCKET);

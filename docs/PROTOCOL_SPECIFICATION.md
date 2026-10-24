@@ -1,7 +1,7 @@
-# Protocol Specification & Compatibility Audit (Phase 4 — Task 1)
+# Protocol Specification & Compatibility Audit (Phase 4 — Task 3)
 
 **Document:** `docs/PROTOCOL_SPECIFICATION.md`  
-**Status:** Implemented and Tested (28/28 Regression Scenarios Passing)  
+**Status:** Implemented and Tested (43/43 Regression Scenarios Passing)  
 **Applicability:** C++17 Multi-Client TCP Chat Architecture  
 
 ---
@@ -150,6 +150,236 @@ Returned when a request fails validation:
 }
 ```
 
+### 4.9 Online User List Request (`user_list_req`)
+Sent by a registered structured client to request the current active online users:
+```json
+{"version": 1, "type": "user_list_req", "id": "req-list-1", "page": 1, "limit": 50}
+```
+**Fields:**
+- `"id"`: Optional client-assigned correlation ID.
+- `"page"`: Optional 1-indexed page number (default `1`). Negative values are rejected.
+- `"limit"`: Optional page size (default `50`, clamped to maximum `50`).
+
+### 4.10 Online User List Response (`user_list_resp`)
+Returned by the server containing active registered users:
+```json
+{
+  "version": 1,
+  "type": "user_list_resp",
+  "id": "req-list-1",
+  "status": "ok",
+  "users": ["Alice", "Bob", "Charlie"],
+  "count": 3,
+  "total_users": 3,
+  "page": 1,
+  "total_pages": 1
+}
+```
+**Semantics and Wire Size Policy:**
+- Includes all currently active, successfully registered users (including the requesting client).
+- Duplicate and rejected registrations never appear in the list.
+- Disconnected clients are removed immediately before leave events are dispatched.
+- Page limit is strictly clamped to `50` users. With maximum username length of 32 characters, $50 \times 35 + 130 \approx 1880$ bytes, guaranteeing every page response fits within the 2048-byte wire frame.
+- If a response would exceed 2048 bytes, the server safely responds with `ERR_MESSAGE_TOO_LARGE` without leaking oversized frames or truncating usernames.
+
+### 4.11 User Join and Leave Updates (`user_joined`, `user_left`, `system_event`)
+When a user registers or disconnects, the server broadcasts an event to all remaining clients:
+- **Join Event (`system_event` with `event: "join"` or `user_joined`)**:
+```json
+{
+  "version": 1,
+  "type": "system_event",
+  "event": "join",
+  "username": "David",
+  "detail": "[System] David has joined the chat.",
+  "timestamp": 1729800000
+}
+```
+- **Leave Event (`system_event` with `event: "leave"` or `user_left`)**:
+```json
+{
+  "version": 1,
+  "type": "system_event",
+  "event": "leave",
+  "username": "David",
+  "detail": "[System] David has left the chat.",
+  "timestamp": 1729800000
+}
+```
+The server guarantees that exactly one leave notification is dispatched when a client disconnects.
+
+### 4.12 Private Messaging (`msg_direct_req`, `msg_direct_ack`, `msg_direct`)
+A registered structured client may send private messages directly to another connected user without leaking content to public chat or unrelated peers.
+
+#### Request Schema (`msg_direct_req`)
+```json
+{
+  "version": 1,
+  "type": "msg_direct_req",
+  "id": "req-dm-1",
+  "to": "Bob",
+  "content": "Hello Bob, this is a secret!"
+}
+```
+- `"to"`: Recipient username (case-insensitive lookup, 1–32 characters, `[a-zA-Z0-9_-]`).
+- `"content"`: Message text (1 to max wire bytes, non-empty).
+- `"id"`: Client correlation ID.
+
+#### Acknowledgement Schema (`msg_direct_ack`)
+Sent to the sender acknowledging server acceptance and socket dispatch:
+```json
+{
+  "version": 1,
+  "type": "msg_direct_ack",
+  "id": "req-dm-1",
+  "status": "ok",
+  "msg_id": "msg-4",
+  "to": "Bob"
+}
+```
+**Acknowledgement Semantics:**
+`msg_direct_ack` confirms that the server has validated the request, resolved the recipient, assigned a monotonic `msg_id`, and successfully queued/transmitted the message payload to the recipient socket. It **does not** imply that the recipient has read, rendered, or acknowledged the message on their client UI (read receipts are reserved for future protocol revisions).
+
+#### Recipient Event Schema (`msg_direct`)
+Delivered strictly and exclusively to the recipient socket:
+```json
+{
+  "version": 1,
+  "type": "msg_direct",
+  "msg_id": "msg-4",
+  "from": "Alice",
+  "content": "Hello Bob, this is a secret!",
+  "timestamp": 1729800005
+}
+```
+
+#### Privacy and Routing Invariants:
+1. **Zero Public Leakage**: Private messages are never broadcast to the general channel or to legacy clients.
+2. **Sender Exclusion**: The sender does not receive `msg_direct`; they receive the correlated `msg_direct_ack`.
+3. **Privacy-Preserving Logs**: The server logger records metadata (`msg_id`, sender, recipient, byte length) but **never logs plaintext message content**.
+4. **Error Handling**:
+   - Nonexistent recipient -> `ERR_RECIPIENT_NOT_FOUND`.
+   - Attempting to direct-message oneself -> `ERR_CANNOT_MESSAGE_SELF`.
+   - Oversized message (envelope > 2048 bytes) -> `ERR_MESSAGE_TOO_LARGE`.
+   - Recipient disconnects during delivery -> gracefully handled without crashing worker threads or leaking to others.
+
+---
+
+### 4.13 Chat Rooms
+Chat rooms provide distinct, isolated multi-user channels within the server.
+
+#### Room Policies:
+1. **Naming Rules**: Room names must be 1 to 32 characters, containing only alphanumeric characters, underscores, and hyphens (`[a-zA-Z0-9_-]`).
+2. **Case-Insensitivity & Uniqueness**: Room names are unique case-insensitively (`#General` and `#general` are the exact same room). Room identifiers are stored and matched in normalized lowercase, while preserving display name conventions.
+3. **Creator Auto-Join**: The user who creates a room automatically joins as its initial member.
+4. **Empty Room Lifecycle**: Rooms are strictly ephemeral and in-memory. When the last member leaves (via explicit `room_leave_req` or disconnect), the room is automatically deleted. Re-creating the room thereafter is permitted.
+5. **Sender ACK Policy**: When a member sends `room_msg_req`, the sender receives `room_msg_ack` containing `msg_id` and does not receive the peer broadcast `room_msg`.
+6. **Authorization Enforcement**: Non-members cannot send messages to a room or query room members (`ERR_NOT_IN_ROOM`). Unregistered clients cannot perform any room operations (`ERR_NOT_REGISTERED`).
+7. **Pagination**: Room lists and member lists support pagination (`page` and `limit`, capped at 50) ensuring all responses fit within 2048 bytes.
+
+#### Room Creation (`room_create_req` & `room_create_resp`)
+```json
+{"version": 1, "type": "room_create_req", "id": "req-cr-1", "room": "gaming"}
+```
+Response:
+```json
+{"version": 1, "type": "room_create_resp", "id": "req-cr-1", "status": "ok", "room": "gaming"}
+```
+Errors: `ERR_INVALID_ROOM_NAME`, `ERR_ROOM_ALREADY_EXISTS`.
+
+#### Room Joining (`room_join_req` & `room_join_resp`)
+```json
+{"version": 1, "type": "room_join_req", "id": "req-jn-1", "room": "gaming"}
+```
+Response:
+```json
+{"version": 1, "type": "room_join_resp", "id": "req-jn-1", "status": "ok", "room": "gaming"}
+```
+Errors: `ERR_ROOM_NOT_FOUND`, `ERR_ALREADY_IN_ROOM`.
+
+#### Room Membership Notifications (`room_user_joined` & `room_user_left`)
+When a user joins, existing members receive:
+```json
+{"version": 1, "type": "room_user_joined", "room": "gaming", "username": "Bob", "timestamp": 1729800010}
+```
+When a user leaves or disconnects, remaining members receive:
+```json
+{"version": 1, "type": "room_user_left", "room": "gaming", "username": "Bob", "timestamp": 1729800020}
+```
+
+#### Room Leaving (`room_leave_req` & `room_leave_resp`)
+```json
+{"version": 1, "type": "room_leave_req", "id": "req-lv-1", "room": "gaming"}
+```
+Response:
+```json
+{"version": 1, "type": "room_leave_resp", "id": "req-lv-1", "status": "ok", "room": "gaming"}
+```
+Errors: `ERR_ROOM_NOT_FOUND`, `ERR_NOT_IN_ROOM`.
+
+#### Room Messaging (`room_msg_req`, `room_msg_ack`, `room_msg`)
+Request:
+```json
+{"version": 1, "type": "room_msg_req", "id": "req-rm-1", "room": "gaming", "content": "GG everyone!"}
+```
+Acknowledgement (to sender):
+```json
+{"version": 1, "type": "room_msg_ack", "id": "req-rm-1", "status": "ok", "msg_id": "msg-8", "room": "gaming"}
+```
+Broadcast Event (to other members of the room):
+```json
+{
+  "version": 1,
+  "type": "room_msg",
+  "msg_id": "msg-8",
+  "room": "gaming",
+  "from": "Alice",
+  "content": "GG everyone!",
+  "timestamp": 1729800025
+}
+```
+
+#### Room Listing (`room_list_req` & `room_list_resp`)
+Request:
+```json
+{"version": 1, "type": "room_list_req", "id": "req-rl-1", "page": 1, "limit": 50}
+```
+Response:
+```json
+{
+  "version": 1,
+  "type": "room_list_resp",
+  "id": "req-rl-1",
+  "status": "ok",
+  "rooms": ["gaming", "general", "lobby"],
+  "count": 3,
+  "total_rooms": 3,
+  "page": 1,
+  "total_pages": 1
+}
+```
+
+#### Room Members Listing (`room_members_req` & `room_members_resp`)
+Request (caller must be a current room member):
+```json
+{"version": 1, "type": "room_members_req", "id": "req-rm-1", "room": "gaming", "page": 1, "limit": 50}
+```
+Response:
+```json
+{
+  "version": 1,
+  "type": "room_members_resp",
+  "id": "req-rm-1",
+  "status": "ok",
+  "room": "gaming",
+  "members": ["Alice", "Bob"],
+  "count": 2,
+  "total_members": 2,
+  "page": 1,
+  "total_pages": 1
+}
+```
+
 ---
 
 ## 5. Standard Error Codes
@@ -159,10 +389,19 @@ Returned when a request fails validation:
 | `ERR_MALFORMED_MESSAGE` | Non-JSON text from structured client, syntax error, or unclosed string | Sends error; continues or terminates based on severity |
 | `ERR_UNSUPPORTED_VERSION` | `"version"` is not equal to `1` | Sends error; safely closes connection |
 | `ERR_UNKNOWN_TYPE` | Unrecognized `"type"` identifier | Sends error; discards unknown message |
+| `ERR_NOT_REGISTERED` | Client sent room/DM/list request before registering | Sends error; closes connection |
+| `ERR_INVALID_PAGE` | Page number in query is negative | Sends error; ignores request |
 | `ERR_INVALID_USERNAME` | Username fails character or length validation rules | Sends error; closes connection |
 | `ERR_USERNAME_TAKEN` | Username matches existing client case-insensitively | Sends error; closes connection |
 | `ERR_EMPTY_MESSAGE` | `"content"` string is empty | Sends error; ignores message |
 | `ERR_MESSAGE_TOO_LARGE` | Wire size exceeds 2048 bytes | Sends error; drops frame or terminates rogue stream |
+| `ERR_RECIPIENT_NOT_FOUND` | Target recipient username does not exist or is offline | Sends error with correlation ID |
+| `ERR_CANNOT_MESSAGE_SELF` | Target recipient username matches sender | Sends error with correlation ID |
+| `ERR_INVALID_ROOM_NAME` | Room name empty, > 32 characters, or contains invalid characters | Sends error with correlation ID |
+| `ERR_ROOM_ALREADY_EXISTS` | Room name already exists (case-insensitive) | Sends error with correlation ID |
+| `ERR_ROOM_NOT_FOUND` | Room name does not exist | Sends error with correlation ID |
+| `ERR_NOT_IN_ROOM` | Client attempts to send message or list members of a room they have not joined | Sends error with correlation ID |
+| `ERR_ALREADY_IN_ROOM` | Client attempts to join a room they are already in | Sends error with correlation ID |
 
 ---
 
@@ -173,21 +412,26 @@ Returned when a request fails validation:
    - Deterministic key ordering via `std::map`.
    - String escaping and unescaping (`\n`, `\r`, `\t`, `\"`, `\\`, unicode hex).
 2. **[common/include/protocol.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol.h)**:
-   - Centralizes version constants, message types, status tokens, and username validation.
+   - Centralizes version constants, message types, status tokens, pagination limits, room limits, and validation helpers.
 3. **[common/include/protocol_message.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol_message.h)**:
-   - High-level `StructuredMessage` representation, serialization/deserialization, semantic validation, and factory helpers.
+   - High-level `StructuredMessage` representation, serialization/deserialization, semantic validation, pagination helpers, and factory helpers for all private and room message contracts.
 4. **[server/include/client_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/client_manager.h) & [server/src/client_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/client_manager.cpp)**:
-   - Tracks client protocol version in `ClientInfo`.
-   - Implements `broadcastStructured()` delivering format-appropriate payloads to legacy and structured clients.
-5. **[server/src/server.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp)**:
-   - Evaluates connection handshake and establishes client protocol mode.
-   - Enforces structured error responses and monotonic message sequencing.
+   - Tracks client protocol version and metadata in `ClientInfo`.
+   - Thread-safe `getClientByUsername()` performs case-insensitive recipient resolution.
+   - Snapshot-under-mutex design: socket transmission occurs strictly after releasing manager mutexes.
+5. **[server/include/room_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/room_manager.h) & [server/src/room_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/room_manager.cpp)**:
+   - Thread-safe `RoomManager` manages room lifecycles and memberships under `m_mutex`.
+   - Independent mutex hierarchy: `RoomManager` never acquires `ClientManager` locks and vice versa.
+   - Snapshot methods return recipient lists without holding mutexes during network I/O.
+   - Automatic cleanup: automatically deletes rooms when the last member departs.
+6. **[server/src/server.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp)**:
+   - Handshake detection, registration enforcement, monotonic message sequencing, private routing, room operations, and clean disconnect teardown.
 
 ---
 
-## 7. Test Results (28/28 Passing)
+## 7. Test Results (43/43 Passing)
 
-The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes both Phase 2/3 legacy tests and Phase 4 structured tests:
+The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes legacy tests and Phase 4 structured tests:
 
 | Test ID | Test Name | Protocol Tested | Status |
 |---|---|---|---|
@@ -219,3 +463,18 @@ The complete regression suite in [tests/regression_tests.py](file:///c:/Users/ha
 | 26 | Structured disconnect request handled and broadcast correctly | Dual-mode | **Passed** |
 | 27 | Protocol detection heuristic & structured message isolation | Structured v1 | **Passed** |
 | 28 | Message-size constraint under JSON escaping and wire bounding | Dual-mode | **Passed** |
+| 29 | Online user list query, correlation IDs, and registry integrity | Structured v1 | **Passed** |
+| 30 | Real-time join/leave updates and registry synchronization | Dual-mode | **Passed** |
+| 31 | User list pagination and oversized wire limit policy | Structured v1 | **Passed** |
+| 32 | Concurrent registration, query, and disconnection thread-safety | Structured v1 | **Passed** |
+| 33 | Private messaging delivery, correlation ID, and isolation | Structured v1 | **Passed** |
+| 34 | Private messaging recipient resolution and error handling | Structured v1 | **Passed** |
+| 35 | Private messaging wire limit bounding and privacy preservation | Structured v1 | **Passed** |
+| 36 | Chat room lifecycle (create, duplicate rejection, join, leave, empty auto-delete) | Structured v1 | **Passed** |
+| 37 | Chat room messaging, sender ACK policy, and member isolation | Structured v1 | **Passed** |
+| 38 | Chat room authorization and non-member rejection | Structured v1 | **Passed** |
+| 39 | Chat room membership events and disconnect cleanup | Structured v1 | **Passed** |
+| 40 | Chat room listing, member listing, and pagination | Structured v1 | **Passed** |
+| 41 | Chat room wire limit bounding | Structured v1 | **Passed** |
+| 42 | Concurrent room operations, private messaging, and thread safety | Structured v1 | **Passed** |
+| 43 | Cross-protocol isolation (legacy client compatibility) | Dual-mode | **Passed** |

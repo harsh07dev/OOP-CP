@@ -1071,3 +1071,34 @@ ALL 17 TESTS PASSED SUCCESSFULLY!
 - **Linux Execution Notice**: The current workstation environment is Windows 11 without WSL, Docker, or a Linux cross-toolchain installed. Native Linux compilation and execution have not been run locally in this environment; all POSIX types, system headers, socket options, and signal semantics have been coded strictly against POSIX.1-2008 and Linux kernel networking standards.
 - **Deployment Status**: In accordance with scope boundaries, deployment to a Linux VPS has **not** started.
 - **Client Status**: Client networking and UI code was preserved without modification.
+
+---
+
+## 19. Phase 4 — Task 3: Private Messaging and Chat Rooms
+
+### 19.1 Scope and Deliverables
+Phase 4 Task 3 extends the backend server to support direct private messaging between clients and isolated, ephemeral chat rooms without breaking legacy clients or violating the strict 2048-byte wire framing limit.
+
+### 19.2 Files Created and Modified
+| File | Action | Purpose |
+|---|---|---|
+| [`common/include/protocol.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol.h) | Modified | Added message types (`msg_direct_req`, `msg_direct_ack`, `msg_direct`, `room_create_*`, `room_join_*`, `room_leave_*`, `room_msg_*`, `room_list_*`, `room_members_*`, `room_user_*`), error codes, room length/pagination limits, and validation helper functions. |
+| [`common/include/protocol_message.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol_message.h) | Modified | Added room/member fields, array serialization/deserialization in JSON, protocol detection extensions, semantic validation rules, and message factory methods. |
+| [`server/include/client_manager.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/client_manager.h) | Modified | Added `getClientByUsername()` for case-insensitive lookup of active client metadata. |
+| [`server/src/client_manager.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/client_manager.cpp) | Modified | Implemented `getClientByUsername()` returning a copy of `ClientInfo` under lock. |
+| [`server/include/room_manager.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/room_manager.h) | Created | Header for thread-safe in-memory room registry, defining room lifecycles, membership operations, snapshots, and empty room auto-deletion. |
+| [`server/src/room_manager.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/room_manager.cpp) | Created | Implementation of `RoomManager` with case-insensitive room names, creator auto-join, authorization checks, and snapshot generation. |
+| [`CMakeLists.txt`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/CMakeLists.txt) | Modified | Added `server/src/room_manager.cpp` to the `chat_server` target. |
+| [`server/include/server.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/server.h) | Modified | Integrated `RoomManager m_roomManager` into `Server`. |
+| [`server/src/server.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp) | Modified | Implemented request dispatchers for private messaging and all room operations; registration checks; sender ACK policy; disconnect cleanup with room membership departure events; privacy-preserving logging. |
+| [`tests/regression_tests.py`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) | Modified | Added build file for `room_manager.cpp`; added `recv_matching()` helper; added Tests 33–43 covering all 20 required verification scenarios. |
+| [`docs/PROTOCOL_SPECIFICATION.md`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/docs/PROTOCOL_SPECIFICATION.md) | Modified | Documented private messaging schemas, room schemas, error codes, acknowledgement semantics, empty room lifecycle, and test matrix. |
+
+### 19.3 Regression Test Verification (43/43 Passing)
+All 43 integration and unit scenarios executed cleanly:
+- **Legacy Tests (1–17)**: Fully preserved; legacy clients continue to broadcast and receive public messages normally.
+- **Structured Baseline Tests (18–32)**: Registration, correlation IDs, user lists, pagination, and size bounding all pass.
+- **Private Messaging Tests (33–35)**: Delivery isolation, correlation IDs, recipient lookup, self-message rejection, nonexistent recipient error, disconnect race handling, wire bounding, and zero log leakage verified.
+- **Chat Room Tests (36–42)**: Creation, case-insensitivity, duplicate rejection, join/leave, empty room auto-deletion, member-only messaging, non-member rejection, sender ACK policy, membership events, disconnect cleanup, pagination, wire bounding, and high concurrency verified.
+- **Cross-Protocol Isolation Test (43)**: Verified that legacy clients never receive private or room messages.
+

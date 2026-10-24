@@ -137,7 +137,7 @@ def run_all_tests():
         print("Using direct compiler build with strong warnings as errors...")
         server_cmd = [
             "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Icommon/include", "-Iserver/include",
-            "server/src/main.cpp", "server/src/server.cpp", "server/src/client_manager.cpp", "server/src/logger.cpp"
+            "server/src/main.cpp", "server/src/server.cpp", "server/src/client_manager.cpp", "server/src/room_manager.cpp", "server/src/logger.cpp"
         ]
         if sys.platform == "win32":
             server_cmd += ["-lws2_32", "-o", "chat_server.exe"]
@@ -980,6 +980,1093 @@ def run_all_tests():
         except Exception as e:
             results["Test 28: Message-size constraint under JSON escaping"] = f"Failed ({e})"
             print("Test 28 FAILED with exception:", e)
+
+        # Test 29: Online User List Query, Correlation IDs, and Registry Integrity
+        print("\n--- Test 29: Online user list query and registry integrity ---")
+        try:
+            t29_passed = True
+            t29_details = []
+
+            # Sub-test 29A: Unregistered user list request rejected with ERR_NOT_REGISTERED
+            s_unreg = BufferedSocket()
+            s_unreg.connect((HOST, PORT))
+            unreg_payload = json.dumps({"version": 1, "type": "user_list_req", "id": "req-unreg-99"}) + "\n"
+            s_unreg.sendall(unreg_payload.encode('utf-8'))
+            unreg_resp_raw = s_unreg.recv_line(timeout=2.0)
+            s_unreg.close()
+            unreg_resp = json.loads(unreg_resp_raw) if unreg_resp_raw.startswith("{") else {}
+            if unreg_resp.get("type") == "error" and unreg_resp.get("code") == "ERR_NOT_REGISTERED" and unreg_resp.get("id") == "req-unreg-99":
+                t29_details.append("29A (unregistered request rejected with ERR_NOT_REGISTERED) OK")
+            else:
+                t29_passed = False
+                t29_details.append(f"29A failed: {unreg_resp}")
+
+            # Sub-test 29B: Active registered users query
+            s_u1 = BufferedSocket()
+            s_u1.connect((HOST, PORT))
+            s_u1.sendall((json.dumps({"version": 1, "type": "register_req", "username": "UListAlice", "id": "reg-u1"}) + "\n").encode('utf-8'))
+            s_u1.recv_line(timeout=2.0)
+
+            s_u2 = BufferedSocket()
+            s_u2.connect((HOST, PORT))
+            s_u2.sendall((json.dumps({"version": 1, "type": "register_req", "username": "UListBob", "id": "reg-u2"}) + "\n").encode('utf-8'))
+            s_u2.recv_line(timeout=2.0)
+
+            s_u3 = BufferedSocket()
+            s_u3.connect((HOST, PORT))
+            s_u3.sendall(b"UListCharlie\n")
+            s_u3.recv_line(timeout=2.0)
+
+            # Drain join announcements on s_u1
+            s_u1.recv_line(timeout=1.0)
+            s_u1.recv_line(timeout=1.0)
+
+            # Sub-test 29C: Duplicate and invalid registration rejection
+            s_dup = BufferedSocket()
+            s_dup.connect((HOST, PORT))
+            s_dup.sendall((json.dumps({"version": 1, "type": "register_req", "username": "ulistalice", "id": "reg-dup"}) + "\n").encode('utf-8'))
+            dup_raw = s_dup.recv_line(timeout=2.0)
+            s_dup.close()
+            dup_resp = json.loads(dup_raw) if dup_raw.startswith("{") else {}
+
+            s_inv = BufferedSocket()
+            s_inv.connect((HOST, PORT))
+            s_inv.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Invalid User Name", "id": "reg-inv"}) + "\n").encode('utf-8'))
+            inv_raw = s_inv.recv_line(timeout=2.0)
+            s_inv.close()
+            inv_resp = json.loads(inv_raw) if inv_raw.startswith("{") else {}
+
+            if dup_resp.get("code") == "ERR_USERNAME_TAKEN" and inv_resp.get("code") == "ERR_INVALID_USERNAME":
+                t29_details.append("29C (duplicate and invalid registrations rejected) OK")
+            else:
+                t29_passed = False
+                t29_details.append(f"29C failed: dup={dup_resp}, inv={inv_resp}")
+
+            # Sub-test 29D: User list response contains all active users including requester, matching correlation ID
+            s_u1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-list-29"}) + "\n").encode('utf-8'))
+            list_raw = s_u1.recv_line(timeout=2.0)
+            list_resp = json.loads(list_raw)
+
+            users_set = set(list_resp.get("users", []))
+            expected_set = {"UListAlice", "UListBob", "UListCharlie"}
+            if (list_resp.get("type") == "user_list_resp" and
+                list_resp.get("status") == "ok" and
+                list_resp.get("id") == "req-list-29" and
+                list_resp.get("total_users") == 3 and
+                list_resp.get("count") == 3 and
+                expected_set.issubset(users_set) and
+                "ulistalice" not in users_set and
+                "Invalid User Name" not in users_set and
+                "UListAlice" in users_set):
+                t29_details.append("29D (user list accurately includes active users and excludes invalid/duplicate) OK")
+            else:
+                t29_passed = False
+                t29_details.append(f"29D failed: {list_resp}")
+
+            if t29_passed:
+                results["Test 29: Online user list query and registry integrity"] = "Passed"
+                print(f"Test 29 PASSED: {'; '.join(t29_details)}")
+            else:
+                results["Test 29: Online user list query and registry integrity"] = f"Failed ({'; '.join(t29_details)})"
+                print(f"Test 29 FAILED: {'; '.join(t29_details)}")
+        except Exception as e:
+            results["Test 29: Online user list query and registry integrity"] = f"Failed ({e})"
+            print("Test 29 FAILED with exception:", e)
+
+        # Test 30: Real-time Join/Leave Updates and Registry State Synchronization
+        print("\n--- Test 30: Real-time join/leave updates and registry synchronization ---")
+        try:
+            t30_passed = True
+            t30_details = []
+
+            # Connect Dave (Structured) while Alice is listening
+            s_u4 = BufferedSocket()
+            s_u4.connect((HOST, PORT))
+            s_u4.sendall((json.dumps({"version": 1, "type": "register_req", "username": "UListDave", "id": "reg-u4"}) + "\n").encode('utf-8'))
+            s_u4.recv_line(timeout=2.0)
+
+            # Alice receives join notification
+            dave_join_raw = s_u1.recv_line(timeout=2.0)
+            dave_join = json.loads(dave_join_raw) if dave_join_raw.startswith("{") else {}
+            if (dave_join.get("type") == "system_event" and
+                dave_join.get("event") == "join" and
+                dave_join.get("username") == "UListDave"):
+                t30_details.append("30A (join notification received by listener) OK")
+            else:
+                t30_passed = False
+                t30_details.append(f"30A failed: {dave_join}")
+
+            # Alice queries user list: Dave is now present
+            s_u1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-list-30a"}) + "\n").encode('utf-8'))
+            list_30a_raw = s_u1.recv_line(timeout=2.0)
+            list_30a = json.loads(list_30a_raw)
+            if "UListDave" in list_30a.get("users", []) and list_30a.get("total_users") == 4:
+                t30_details.append("30B (registry reflects joined user) OK")
+            else:
+                t30_passed = False
+                t30_details.append(f"30B failed: {list_30a}")
+
+            # Dave disconnects with disconnect_req
+            s_u4.sendall((json.dumps({"version": 1, "type": "disconnect_req", "id": "disc-u4"}) + "\n").encode('utf-8'))
+            s_u4.close()
+
+            # Alice receives leave notification
+            dave_leave_raw = s_u1.recv_line(timeout=2.0)
+            dave_leave = json.loads(dave_leave_raw) if dave_leave_raw.startswith("{") else {}
+            # Verify no second leave notification
+            dup_leave = s_u1.recv_line(timeout=0.4)
+
+            if (dave_leave.get("type") == "system_event" and
+                dave_leave.get("event") == "leave" and
+                dave_leave.get("username") == "UListDave" and
+                dup_leave == ""):
+                t30_details.append("30C (exactly one leave notification received) OK")
+            else:
+                t30_passed = False
+                t30_details.append(f"30C failed: leave={dave_leave}, dup='{dup_leave}'")
+
+            # Alice queries user list: Dave is removed
+            s_u1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-list-30b"}) + "\n").encode('utf-8'))
+            list_30b_raw = s_u1.recv_line(timeout=2.0)
+            list_30b = json.loads(list_30b_raw)
+            if "UListDave" not in list_30b.get("users", []) and list_30b.get("total_users") == 3:
+                t30_details.append("30D (registry reflects departed user) OK")
+            else:
+                t30_passed = False
+                t30_details.append(f"30D failed: {list_30b}")
+
+            # Legacy client sends chat: legacy compatibility preserved
+            s_u3.sendall(b"Hello from legacy Charlie\n")
+            charlie_bcast_raw = s_u1.recv_line(timeout=2.0)
+            charlie_bcast = json.loads(charlie_bcast_raw) if charlie_bcast_raw.startswith("{") else {}
+            if (charlie_bcast.get("type") == "msg_broadcast" and
+                charlie_bcast.get("from") == "UListCharlie" and
+                charlie_bcast.get("content") == "Hello from legacy Charlie"):
+                t30_details.append("30E (legacy client communication preserved) OK")
+            else:
+                t30_passed = False
+                t30_details.append(f"30E failed: {charlie_bcast}")
+
+            s_u1.close()
+            s_u2.close()
+            s_u3.close()
+
+            if t30_passed:
+                results["Test 30: Real-time join/leave updates and registry synchronization"] = "Passed"
+                print(f"Test 30 PASSED: {'; '.join(t30_details)}")
+            else:
+                results["Test 30: Real-time join/leave updates and registry synchronization"] = f"Failed ({'; '.join(t30_details)})"
+                print(f"Test 30 FAILED: {'; '.join(t30_details)}")
+        except Exception as e:
+            results["Test 30: Real-time join/leave updates and registry synchronization"] = f"Failed ({e})"
+            print("Test 30 FAILED with exception:", e)
+
+        # Test 31: User List Pagination and Oversized Wire Limit Policy
+        print("\n--- Test 31: User list pagination and oversized wire limit policy ---")
+        try:
+            t31_passed = True
+            t31_details = []
+
+            # Connect 3 clients for pagination tests
+            s_p1 = BufferedSocket()
+            s_p1.connect((HOST, PORT))
+            s_p1.sendall((json.dumps({"version": 1, "type": "register_req", "username": "PagAlice", "id": "reg-p1"}) + "\n").encode('utf-8'))
+            s_p1.recv_line(timeout=2.0)
+
+            s_p2 = BufferedSocket()
+            s_p2.connect((HOST, PORT))
+            s_p2.sendall((json.dumps({"version": 1, "type": "register_req", "username": "PagBob", "id": "reg-p2"}) + "\n").encode('utf-8'))
+            s_p2.recv_line(timeout=2.0)
+
+            s_p3 = BufferedSocket()
+            s_p3.connect((HOST, PORT))
+            s_p3.sendall((json.dumps({"version": 1, "type": "register_req", "username": "PagCharlie", "id": "reg-p3"}) + "\n").encode('utf-8'))
+            s_p3.recv_line(timeout=2.0)
+
+            # Drain join events on s_p1
+            s_p1.recv_line(timeout=1.0)
+            s_p1.recv_line(timeout=1.0)
+
+            # Sub-test 31A: Page 1 with limit 2
+            s_p1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-pag-1", "page": 1, "limit": 2}) + "\n").encode('utf-8'))
+            p1_raw = s_p1.recv_line(timeout=2.0)
+            p1_data = json.loads(p1_raw)
+            p1_users = p1_data.get("users", [])
+
+            # Sub-test 31B: Page 2 with limit 2
+            s_p1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-pag-2", "page": 2, "limit": 2}) + "\n").encode('utf-8'))
+            p2_raw = s_p1.recv_line(timeout=2.0)
+            p2_data = json.loads(p2_raw)
+            p2_users = p2_data.get("users", [])
+
+            if (p1_data.get("page") == 1 and p1_data.get("total_pages") == 2 and p1_data.get("total_users") == 3 and len(p1_users) == 2 and
+                p2_data.get("page") == 2 and p2_data.get("total_pages") == 2 and p2_data.get("total_users") == 3 and len(p2_users) == 1 and
+                len(set(p1_users).intersection(set(p2_users))) == 0 and
+                set(p1_users).union(set(p2_users)) == {"PagAlice", "PagBob", "PagCharlie"}):
+                t31_details.append("31A & 31B (page 1 and page 2 pagination slices accurate and disjoint) OK")
+            else:
+                t31_passed = False
+                t31_details.append(f"31A/B failed: p1={p1_data}, p2={p2_data}")
+
+            # Sub-test 31C: Page 3 with limit 2 (out of range)
+            s_p1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-pag-3", "page": 3, "limit": 2}) + "\n").encode('utf-8'))
+            p3_raw = s_p1.recv_line(timeout=2.0)
+            p3_data = json.loads(p3_raw)
+            if p3_data.get("page") == 3 and p3_data.get("count") == 0 and p3_data.get("users") == []:
+                t31_details.append("31C (out-of-range page returns empty list with status ok) OK")
+            else:
+                t31_passed = False
+                t31_details.append(f"31C failed: {p3_data}")
+
+            # Sub-test 31D: Negative page parameter rejected safely
+            s_p1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-pag-neg", "page": -1}) + "\n").encode('utf-8'))
+            p_neg_raw = s_p1.recv_line(timeout=2.0)
+            p_neg_data = json.loads(p_neg_raw)
+            if p_neg_data.get("type") == "error" and p_neg_data.get("code") == "ERR_MALFORMED_MESSAGE":
+                t31_details.append("31D (negative page rejected with ERR_MALFORMED_MESSAGE) OK")
+            else:
+                t31_passed = False
+                t31_details.append(f"31D failed: {p_neg_data}")
+
+            # Sub-test 31E: Clamping requested limit to MAX_USER_LIST_LIMIT and strictly bounding wire size
+            s_p1.sendall((json.dumps({"version": 1, "type": "user_list_req", "id": "req-pag-clamp", "limit": 9999}) + "\n").encode('utf-8'))
+            p_clamp_raw = s_p1.recv_line(timeout=2.0)
+            p_clamp_wire_size = len(p_clamp_raw.encode('utf-8')) + 1
+            p_clamp_data = json.loads(p_clamp_raw)
+            if p_clamp_data.get("status") == "ok" and p_clamp_wire_size <= 2048:
+                t31_details.append(f"31E (large limit clamped safely, wire size={p_clamp_wire_size} <= 2048) OK")
+            else:
+                t31_passed = False
+                t31_details.append(f"31E failed: wire_size={p_clamp_wire_size}")
+
+            s_p1.close()
+            s_p2.close()
+            s_p3.close()
+
+            if t31_passed:
+                results["Test 31: User list pagination and oversized wire limit policy"] = "Passed"
+                print(f"Test 31 PASSED: {'; '.join(t31_details)}")
+            else:
+                results["Test 31: User list pagination and oversized wire limit policy"] = f"Failed ({'; '.join(t31_details)})"
+                print(f"Test 31 FAILED: {'; '.join(t31_details)}")
+        except Exception as e:
+            results["Test 31: User list pagination and oversized wire limit policy"] = f"Failed ({e})"
+            print("Test 31 FAILED with exception:", e)
+
+        # Test 32: Concurrent Registration, Query, and Disconnection Thread-Safety
+        print("\n--- Test 32: Concurrent registration, query, and disconnection thread-safety ---")
+        try:
+            con_errors = []
+            num_con_threads = 8
+
+            def worker_concurrent_task(thread_id):
+                uname = f"ConUser_{thread_id}"
+                try:
+                    sock = BufferedSocket()
+                    sock.connect((HOST, PORT))
+                    # Register
+                    reg = json.dumps({"version": 1, "type": "register_req", "username": uname, "id": f"reg-{thread_id}"}) + "\n"
+                    sock.sendall(reg.encode('utf-8'))
+                    
+                    # Read until register_ack is received (filtering out concurrent join/leave system_events)
+                    start_t = time.time()
+                    ack = None
+                    while time.time() - start_t < 4.0:
+                        line = sock.recv_line(timeout=1.0)
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if data.get("type") == "register_ack":
+                                ack = data
+                                break
+                        except Exception:
+                            pass
+
+                    if not ack or ack.get("username") != uname:
+                        con_errors.append(f"Thread {thread_id} registration failed: {ack}")
+                        sock.close()
+                        return
+
+                    # Query user list
+                    time.sleep(0.05)
+                    q = json.dumps({"version": 1, "type": "user_list_req", "id": f"q-{thread_id}"}) + "\n"
+                    sock.sendall(q.encode('utf-8'))
+                    
+                    # Read until user_list_resp is received (filtering out concurrent broadcasts)
+                    start_t = time.time()
+                    resp = None
+                    while time.time() - start_t < 4.0:
+                        line = sock.recv_line(timeout=1.0)
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if data.get("type") == "user_list_resp":
+                                resp = data
+                                break
+                        except Exception:
+                            pass
+
+                    if not resp or resp.get("status") != "ok" or resp.get("id") != f"q-{thread_id}":
+                        con_errors.append(f"Thread {thread_id} list query failed: {resp}")
+
+                    # Disconnect
+                    disc = json.dumps({"version": 1, "type": "disconnect_req", "id": f"disc-{thread_id}"}) + "\n"
+                    sock.sendall(disc.encode('utf-8'))
+                    time.sleep(0.05)
+                    sock.close()
+                except Exception as ex:
+                    con_errors.append(f"Thread {thread_id} exception: {ex}")
+
+            threads = []
+            for i in range(num_con_threads):
+                t = threading.Thread(target=worker_concurrent_task, args=(i,))
+                threads.append(t)
+                t.start()
+
+            for t in threads:
+                t.join(timeout=5.0)
+
+            if len(con_errors) == 0:
+                results["Test 32: Concurrent registration, query, and disconnection thread-safety"] = "Passed"
+                print(f"Test 32 PASSED: All {num_con_threads} concurrent threads completed successfully without corruption.")
+            else:
+                results["Test 32: Concurrent registration, query, and disconnection thread-safety"] = f"Failed ({len(con_errors)} errors: {con_errors[:3]})"
+                print(f"Test 32 FAILED: {con_errors}")
+        except Exception as e:
+            results["Test 32: Concurrent registration, query, and disconnection thread-safety"] = f"Failed ({e})"
+            print("Test 32 FAILED with exception:", e)
+
+        def recv_matching(sock, expected_types, timeout=3.0):
+            start = time.time()
+            while time.time() - start < timeout:
+                line = sock.recv_line(timeout=max(0.2, timeout - (time.time() - start)))
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("type") in expected_types:
+                        return data
+                except Exception:
+                    pass
+            return None
+
+        # Test 33: Private messaging delivery, correlation ID, message ID, timestamp, and isolation
+        print("\n--- Test 33: Private messaging delivery, correlation ID, and isolation ---")
+        try:
+            s_dm_a = BufferedSocket()
+            s_dm_a.connect((HOST, PORT))
+            s_dm_a.sendall((json.dumps({"version": 1, "type": "register_req", "username": "DmAlice33", "id": "reg-dma"}) + "\n").encode('utf-8'))
+            s_dm_a.recv_line(timeout=2.0)
+
+            s_dm_b = BufferedSocket()
+            s_dm_b.connect((HOST, PORT))
+            s_dm_b.sendall((json.dumps({"version": 1, "type": "register_req", "username": "DmBob33", "id": "reg-dmb"}) + "\n").encode('utf-8'))
+            s_dm_b.recv_line(timeout=2.0)
+
+            s_dm_e = BufferedSocket()
+            s_dm_e.connect((HOST, PORT))
+            s_dm_e.sendall((json.dumps({"version": 1, "type": "register_req", "username": "DmEve33", "id": "reg-dme"}) + "\n").encode('utf-8'))
+            s_dm_e.recv_line(timeout=2.0)
+
+            time.sleep(0.1)
+
+            # Alice sends DM to Bob
+            dm_req = json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-dm-33", "to": "DmBob33", "content": "Secret 12345"}) + "\n"
+            s_dm_a.sendall(dm_req.encode('utf-8'))
+
+            ack_data = recv_matching(s_dm_a, ["msg_direct_ack"], timeout=2.0)
+            dm_data = recv_matching(s_dm_b, ["msg_direct"], timeout=2.0)
+            eve_line = s_dm_e.recv_line(timeout=0.6)
+
+            ack_ok = (ack_data is not None and
+                      ack_data.get("status") == "ok" and
+                      ack_data.get("id") == "req-dm-33" and
+                      ack_data.get("to") == "DmBob33" and
+                      isinstance(ack_data.get("msg_id"), str) and
+                      ack_data.get("msg_id").startswith("msg-") and
+                      isinstance(ack_data.get("timestamp"), int) and
+                      ack_data.get("timestamp") > 0)
+
+            dm_ok = (dm_data is not None and
+                     dm_data.get("from") == "DmAlice33" and
+                     dm_data.get("to") == "DmBob33" and
+                     dm_data.get("content") == "Secret 12345" and
+                     ack_data is not None and
+                     dm_data.get("msg_id") == ack_data.get("msg_id"))
+
+            eve_ok = (eve_line == "" or "Secret 12345" not in eve_line)
+
+            if ack_ok and dm_ok and eve_ok:
+                results["Test 33: Private messaging delivery, correlation ID, and isolation"] = "Passed"
+                print("Test 33 PASSED: Direct message delivered to recipient with matching correlation ID and zero leak.")
+            else:
+                results["Test 33: Private messaging delivery, correlation ID, and isolation"] = f"Failed (ack={ack_data}, dm={dm_data}, eve='{eve_line}')"
+                print("Test 33 FAILED")
+
+            s_dm_a.close()
+            s_dm_b.close()
+            s_dm_e.close()
+        except Exception as e:
+            results["Test 33: Private messaging delivery, correlation ID, and isolation"] = f"Failed ({e})"
+            print("Test 33 FAILED with exception:", e)
+
+        # Test 34: Private messaging recipient resolution and error handling
+        print("\n--- Test 34: Private messaging recipient resolution and error handling ---")
+        try:
+            t34_passed = True
+            t34_details = []
+
+            s_a34 = BufferedSocket()
+            s_a34.connect((HOST, PORT))
+            s_a34.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice34", "id": "reg-a34"}) + "\n").encode('utf-8'))
+            s_a34.recv_line(timeout=2.0)
+
+            s_b34 = BufferedSocket()
+            s_b34.connect((HOST, PORT))
+            s_b34.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob34", "id": "reg-b34"}) + "\n").encode('utf-8'))
+            s_b34.recv_line(timeout=2.0)
+
+            # 34A: Nonexistent recipient
+            s_a34.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-34a", "to": "NoSuchUser", "content": "Hi"}) + "\n").encode('utf-8'))
+            resp_34a = recv_matching(s_a34, ["error"], timeout=2.0)
+            if resp_34a and resp_34a.get("code") == "ERR_RECIPIENT_NOT_FOUND" and resp_34a.get("id") == "req-34a":
+                t34_details.append("34A (nonexistent recipient rejected with ERR_RECIPIENT_NOT_FOUND) OK")
+            else:
+                t34_passed = False
+                t34_details.append(f"34A failed: {resp_34a}")
+
+            # 34B: Self-messaging
+            s_a34.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-34b", "to": "Alice34", "content": "Note to self"}) + "\n").encode('utf-8'))
+            resp_34b = recv_matching(s_a34, ["error"], timeout=2.0)
+            if resp_34b and resp_34b.get("code") == "ERR_CANNOT_MESSAGE_SELF" and resp_34b.get("id") == "req-34b":
+                t34_details.append("34B (self-messaging rejected with ERR_CANNOT_MESSAGE_SELF) OK")
+            else:
+                t34_passed = False
+                t34_details.append(f"34B failed: {resp_34b}")
+
+            # 34C: Invalid username format
+            s_a34.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-34c", "to": "Invalid User!", "content": "Hi"}) + "\n").encode('utf-8'))
+            resp_34c = recv_matching(s_a34, ["error"], timeout=2.0)
+            if resp_34c and resp_34c.get("code") == "ERR_INVALID_USERNAME" and resp_34c.get("id") == "req-34c":
+                t34_details.append("34C (invalid username format rejected with ERR_INVALID_USERNAME) OK")
+            else:
+                t34_passed = False
+                t34_details.append(f"34C failed: {resp_34c}")
+
+            # 34D: Case-insensitive recipient matching
+            s_a34.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-34d", "to": "bOb34", "content": "Case insensitive"}) + "\n").encode('utf-8'))
+            ack_34d = recv_matching(s_a34, ["msg_direct_ack"], timeout=2.0)
+            dm_34d = recv_matching(s_b34, ["msg_direct"], timeout=2.0)
+            if ack_34d and dm_34d and dm_34d.get("content") == "Case insensitive" and dm_34d.get("to") == "Bob34":
+                t34_details.append("34D (case-insensitive username resolution verified) OK")
+            else:
+                t34_passed = False
+                t34_details.append(f"34D failed: ack={ack_34d}, dm={dm_34d}")
+
+            # 34E: Recipient disconnect during delivery does not crash server
+            s_b34.set_linger_abort()
+            s_b34.close()
+            time.sleep(0.1)
+            s_a34.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-34e", "to": "Bob34", "content": "Are you there?"}) + "\n").encode('utf-8'))
+            resp_34e = recv_matching(s_a34, ["error"], timeout=2.0)
+            if resp_34e and resp_34e.get("code") == "ERR_RECIPIENT_NOT_FOUND":
+                t34_details.append("34E (disconnected recipient safely handled without server crash) OK")
+            else:
+                t34_passed = False
+                t34_details.append(f"34E failed: {resp_34e}")
+
+            s_a34.close()
+
+            if t34_passed:
+                results["Test 34: Private messaging recipient resolution and error handling"] = "Passed"
+                print(f"Test 34 PASSED: {'; '.join(t34_details)}")
+            else:
+                results["Test 34: Private messaging recipient resolution and error handling"] = f"Failed ({'; '.join(t34_details)})"
+                print(f"Test 34 FAILED: {'; '.join(t34_details)}")
+        except Exception as e:
+            results["Test 34: Private messaging recipient resolution and error handling"] = f"Failed ({e})"
+            print("Test 34 FAILED with exception:", e)
+
+        # Test 35: Private messaging wire limit bounding and privacy preservation
+        print("\n--- Test 35: Private messaging wire limit bounding and privacy preservation ---")
+        try:
+            t35_passed = True
+            t35_details = []
+
+            s_a35 = BufferedSocket()
+            s_a35.connect((HOST, PORT))
+            s_a35.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice35", "id": "reg-a35"}) + "\n").encode('utf-8'))
+            s_a35.recv_line(timeout=2.0)
+
+            s_b35 = BufferedSocket()
+            s_b35.connect((HOST, PORT))
+            s_b35.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob35", "id": "reg-b35"}) + "\n").encode('utf-8'))
+            s_b35.recv_line(timeout=2.0)
+
+            # 35A: Oversized serialized payload (> 2048 bytes due to escaping)
+            big_content = '"' * 980
+            s_a35.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-35a", "to": "Bob35", "content": big_content}) + "\n").encode('utf-8'))
+            resp_35a = recv_matching(s_a35, ["error"], timeout=2.0)
+            bob_leak = s_b35.recv_line(timeout=0.6)
+            if resp_35a and resp_35a.get("code") == "ERR_MESSAGE_TOO_LARGE" and resp_35a.get("id") == "req-35a" and (bob_leak == "" or "type" not in bob_leak):
+                t35_details.append("35A (oversized private message rejected with ERR_MESSAGE_TOO_LARGE; no recipient leak) OK")
+            else:
+                t35_passed = False
+                t35_details.append(f"35A failed: resp={resp_35a}, leak='{bob_leak}'")
+
+            # 35B: Bounded payload that fits within 2048 bytes wire
+            fit_content = '"' * 700
+            s_a35.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "req-35b", "to": "Bob35", "content": fit_content}) + "\n").encode('utf-8'))
+            ack_35b = recv_matching(s_a35, ["msg_direct_ack"], timeout=2.0)
+            dm_35b = recv_matching(s_b35, ["msg_direct"], timeout=2.0)
+            if ack_35b and dm_35b and dm_35b.get("content") == fit_content:
+                t35_details.append("35B (bounded private message delivered successfully) OK")
+            else:
+                t35_passed = False
+                t35_details.append(f"35B failed: ack={ack_35b}, dm={dm_35b}")
+
+            s_a35.close()
+            s_b35.close()
+
+            if t35_passed:
+                results["Test 35: Private messaging wire limit bounding and privacy preservation"] = "Passed"
+                print(f"Test 35 PASSED: {'; '.join(t35_details)}")
+            else:
+                results["Test 35: Private messaging wire limit bounding and privacy preservation"] = f"Failed ({'; '.join(t35_details)})"
+                print(f"Test 35 FAILED: {'; '.join(t35_details)}")
+        except Exception as e:
+            results["Test 35: Private messaging wire limit bounding and privacy preservation"] = f"Failed ({e})"
+            print("Test 35 FAILED with exception:", e)
+
+        # Test 36: Chat room lifecycle (creation, duplicate rejection, join, leave, auto-join, empty cleanup)
+        print("\n--- Test 36: Chat room lifecycle ---")
+        try:
+            t36_passed = True
+            t36_details = []
+
+            s_u1 = BufferedSocket()
+            s_u1.connect((HOST, PORT))
+            s_u1.sendall((json.dumps({"version": 1, "type": "register_req", "username": "RoomUser1", "id": "reg-ru1"}) + "\n").encode('utf-8'))
+            s_u1.recv_line(timeout=2.0)
+
+            s_u2 = BufferedSocket()
+            s_u2.connect((HOST, PORT))
+            s_u2.sendall((json.dumps({"version": 1, "type": "register_req", "username": "RoomUser2", "id": "reg-ru2"}) + "\n").encode('utf-8'))
+            s_u2.recv_line(timeout=2.0)
+
+            # 36A: Create room #general and auto-join
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "req-cr-1", "room": "#general"}) + "\n").encode('utf-8'))
+            cr_resp = recv_matching(s_u1, ["room_create_resp"], timeout=2.0)
+            if cr_resp and cr_resp.get("status") == "ok" and cr_resp.get("room") == "#general" and cr_resp.get("id") == "req-cr-1":
+                t36_details.append("36A (room creation succeeded) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36A failed: {cr_resp}")
+
+            # Verify auto-join via room_members_req
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_members_req", "id": "req-mem-1", "room": "#general"}) + "\n").encode('utf-8'))
+            mem_resp = recv_matching(s_u1, ["room_members_resp"], timeout=2.0)
+            if mem_resp and "RoomUser1" in mem_resp.get("members", []):
+                t36_details.append("36A-2 (creator auto-joined) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36A-2 failed: {mem_resp}")
+
+            # 36B: Duplicate room creation rejected (case-insensitive)
+            s_u2.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "req-cr-dup", "room": "#GENERAL"}) + "\n").encode('utf-8'))
+            dup_resp = recv_matching(s_u2, ["error"], timeout=2.0)
+            if dup_resp and dup_resp.get("code") == "ERR_ROOM_ALREADY_EXISTS":
+                t36_details.append("36B (duplicate room creation rejected with ERR_ROOM_ALREADY_EXISTS) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36B failed: {dup_resp}")
+
+            # 36C: User 2 joins room
+            s_u2.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "req-jn-2", "room": "#general"}) + "\n").encode('utf-8'))
+            jn_resp = recv_matching(s_u2, ["room_join_resp"], timeout=2.0)
+            u1_got_join = recv_matching(s_u1, ["room_user_joined"], timeout=2.0)
+            if jn_resp and jn_resp.get("status") == "ok" and u1_got_join and u1_got_join.get("username") == "RoomUser2":
+                t36_details.append("36C (room join and room_user_joined broadcast verified) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36C failed: jn={jn_resp}, u1_got={u1_got_join}")
+
+            # 36D: User 2 leaves room
+            s_u2.sendall((json.dumps({"version": 1, "type": "room_leave_req", "id": "req-lv-2", "room": "#general"}) + "\n").encode('utf-8'))
+            lv_resp = recv_matching(s_u2, ["room_leave_resp"], timeout=2.0)
+            u1_got_leave = recv_matching(s_u1, ["room_user_left"], timeout=2.0)
+            if lv_resp and lv_resp.get("status") == "ok" and u1_got_leave and u1_got_leave.get("username") == "RoomUser2":
+                t36_details.append("36D (room leave and room_user_left broadcast verified) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36D failed: lv={lv_resp}, u1_got={u1_got_leave}")
+
+            # 36E: Empty room auto-deletion
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_leave_req", "id": "req-lv-1", "room": "#general"}) + "\n").encode('utf-8'))
+            recv_matching(s_u1, ["room_leave_resp"], timeout=2.0)
+
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_list_req", "id": "req-rlist-chk"}) + "\n").encode('utf-8'))
+            rlist_resp = recv_matching(s_u1, ["room_list_resp"], timeout=2.0)
+            if rlist_resp and "#general" not in rlist_resp.get("rooms", []):
+                t36_details.append("36E (empty room automatically deleted) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36E failed: {rlist_resp}")
+
+            # 36F: Recreate deleted room
+            s_u2.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "req-cr-re", "room": "#general"}) + "\n").encode('utf-8'))
+            re_resp = recv_matching(s_u2, ["room_create_resp"], timeout=2.0)
+            if re_resp and re_resp.get("status") == "ok":
+                t36_details.append("36F (re-creation of empty deleted room succeeded) OK")
+            else:
+                t36_passed = False
+                t36_details.append(f"36F failed: {re_resp}")
+
+            s_u1.close()
+            s_u2.close()
+
+            if t36_passed:
+                results["Test 36: Chat room lifecycle (create, duplicate rejection, join, leave, empty cleanup)"] = "Passed"
+                print(f"Test 36 PASSED: {'; '.join(t36_details)}")
+            else:
+                results["Test 36: Chat room lifecycle (create, duplicate rejection, join, leave, empty cleanup)"] = f"Failed ({'; '.join(t36_details)})"
+                print(f"Test 36 FAILED: {'; '.join(t36_details)}")
+        except Exception as e:
+            results["Test 36: Chat room lifecycle (create, duplicate rejection, join, leave, empty cleanup)"] = f"Failed ({e})"
+            print("Test 36 FAILED with exception:", e)
+
+        # Test 37: Chat room messaging, sender ACK policy, and member isolation
+        print("\n--- Test 37: Chat room messaging, sender ACK policy, and member isolation ---")
+        try:
+            s_a37 = BufferedSocket()
+            s_a37.connect((HOST, PORT))
+            s_a37.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice37", "id": "reg-a37"}) + "\n").encode('utf-8'))
+            s_a37.recv_line(timeout=2.0)
+
+            s_b37 = BufferedSocket()
+            s_b37.connect((HOST, PORT))
+            s_b37.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob37", "id": "reg-b37"}) + "\n").encode('utf-8'))
+            s_b37.recv_line(timeout=2.0)
+
+            s_c37 = BufferedSocket()
+            s_c37.connect((HOST, PORT))
+            s_c37.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Charlie37", "id": "reg-c37"}) + "\n").encode('utf-8'))
+            s_c37.recv_line(timeout=2.0)
+
+            s_d37 = BufferedSocket()
+            s_d37.connect((HOST, PORT))
+            s_d37.sendall((json.dumps({"version": 1, "type": "register_req", "username": "David37", "id": "reg-d37"}) + "\n").encode('utf-8'))
+            s_d37.recv_line(timeout=2.0)
+
+            s_a37.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-alpha", "room": "#alpha"}) + "\n").encode('utf-8'))
+            recv_matching(s_a37, ["room_create_resp"], timeout=2.0)
+
+            s_b37.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-alpha", "room": "#alpha"}) + "\n").encode('utf-8'))
+            recv_matching(s_b37, ["room_join_resp"], timeout=2.0)
+            recv_matching(s_a37, ["room_user_joined"], timeout=2.0)
+
+            s_c37.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-beta", "room": "#beta"}) + "\n").encode('utf-8'))
+            recv_matching(s_c37, ["room_create_resp"], timeout=2.0)
+
+            s_a37.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "req-rmsg-37", "room": "#alpha", "content": "Alpha team message"}) + "\n").encode('utf-8'))
+
+            ack_a = recv_matching(s_a37, ["room_msg_ack"], timeout=2.0)
+            a_leak = s_a37.recv_line(timeout=0.4)
+            b_msg = recv_matching(s_b37, ["room_msg"], timeout=2.0)
+            c_leak = s_c37.recv_line(timeout=0.4)
+            d_leak = s_d37.recv_line(timeout=0.4)
+
+            ack_ok = (ack_a is not None and
+                      ack_a.get("status") == "ok" and
+                      ack_a.get("id") == "req-rmsg-37" and
+                      ack_a.get("room") == "#alpha" and
+                      isinstance(ack_a.get("msg_id"), str) and
+                      ack_a.get("msg_id").startswith("msg-"))
+
+            b_ok = (b_msg is not None and
+                    b_msg.get("from") == "Alice37" and
+                    b_msg.get("room") == "#alpha" and
+                    b_msg.get("content") == "Alpha team message" and
+                    ack_a is not None and
+                    b_msg.get("msg_id") == ack_a.get("msg_id"))
+
+            isolation_ok = (("Alpha team message" not in a_leak) and
+                            ("Alpha team message" not in c_leak) and
+                            ("Alpha team message" not in d_leak))
+
+            if ack_ok and b_ok and isolation_ok:
+                results["Test 37: Chat room messaging, sender ACK policy, and member isolation"] = "Passed"
+                print("Test 37 PASSED: Room message delivered only to room peers; sender received ACK only; others received zero leak.")
+            else:
+                results["Test 37: Chat room messaging, sender ACK policy, and member isolation"] = f"Failed (ack={ack_a}, b={b_msg}, c_leak='{c_leak}')"
+                print("Test 37 FAILED")
+
+            s_a37.close()
+            s_b37.close()
+            s_c37.close()
+            s_d37.close()
+        except Exception as e:
+            results["Test 37: Chat room messaging, sender ACK policy, and member isolation"] = f"Failed ({e})"
+            print("Test 37 FAILED with exception:", e)
+
+        # Test 38: Chat room authorization and non-member rejection
+        print("\n--- Test 38: Chat room authorization and non-member rejection ---")
+        try:
+            t38_passed = True
+            t38_details = []
+
+            s_a38 = BufferedSocket()
+            s_a38.connect((HOST, PORT))
+            s_a38.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice38", "id": "reg-a38"}) + "\n").encode('utf-8'))
+            s_a38.recv_line(timeout=2.0)
+
+            s_b38 = BufferedSocket()
+            s_b38.connect((HOST, PORT))
+            s_b38.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob38", "id": "reg-b38"}) + "\n").encode('utf-8'))
+            s_b38.recv_line(timeout=2.0)
+
+            s_a38.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-priv", "room": "#private_room"}) + "\n").encode('utf-8'))
+            recv_matching(s_a38, ["room_create_resp"], timeout=2.0)
+
+            # 38A: Non-member Bob attempts to send room_msg_req -> ERR_NOT_IN_ROOM
+            s_b38.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "req-38a", "room": "#private_room", "content": "I am not a member"}) + "\n").encode('utf-8'))
+            resp_38a = recv_matching(s_b38, ["error"], timeout=2.0)
+            if resp_38a and resp_38a.get("code") == "ERR_NOT_IN_ROOM":
+                t38_details.append("38A (non-member message rejected with ERR_NOT_IN_ROOM) OK")
+            else:
+                t38_passed = False
+                t38_details.append(f"38A failed: {resp_38a}")
+
+            # 38B: Non-member Bob attempts to leave room -> ERR_NOT_IN_ROOM
+            s_b38.sendall((json.dumps({"version": 1, "type": "room_leave_req", "id": "req-38b", "room": "#private_room"}) + "\n").encode('utf-8'))
+            resp_38b = recv_matching(s_b38, ["error"], timeout=2.0)
+            if resp_38b and resp_38b.get("code") == "ERR_NOT_IN_ROOM":
+                t38_details.append("38B (non-member leave rejected with ERR_NOT_IN_ROOM) OK")
+            else:
+                t38_passed = False
+                t38_details.append(f"38B failed: {resp_38b}")
+
+            # 38C: Non-member Bob attempts to query room members -> ERR_NOT_IN_ROOM
+            s_b38.sendall((json.dumps({"version": 1, "type": "room_members_req", "id": "req-38c", "room": "#private_room"}) + "\n").encode('utf-8'))
+            resp_38c = recv_matching(s_b38, ["error"], timeout=2.0)
+            if resp_38c and resp_38c.get("code") == "ERR_NOT_IN_ROOM":
+                t38_details.append("38C (non-member query rejected with ERR_NOT_IN_ROOM) OK")
+            else:
+                t38_passed = False
+                t38_details.append(f"38C failed: {resp_38c}")
+
+            # 38D: Message to nonexistent room -> ERR_ROOM_NOT_FOUND
+            s_a38.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "req-38d", "room": "#ghost_room", "content": "Boo"}) + "\n").encode('utf-8'))
+            resp_38d = recv_matching(s_a38, ["error"], timeout=2.0)
+            if resp_38d and resp_38d.get("code") == "ERR_ROOM_NOT_FOUND":
+                t38_details.append("38D (nonexistent room message rejected with ERR_ROOM_NOT_FOUND) OK")
+            else:
+                t38_passed = False
+                t38_details.append(f"38D failed: {resp_38d}")
+
+            s_a38.close()
+            s_b38.close()
+
+            if t38_passed:
+                results["Test 38: Chat room authorization and non-member rejection"] = "Passed"
+                print(f"Test 38 PASSED: {'; '.join(t38_details)}")
+            else:
+                results["Test 38: Chat room authorization and non-member rejection"] = f"Failed ({'; '.join(t38_details)})"
+                print(f"Test 38 FAILED: {'; '.join(t38_details)}")
+        except Exception as e:
+            results["Test 38: Chat room authorization and non-member rejection"] = f"Failed ({e})"
+            print("Test 38 FAILED with exception:", e)
+
+        # Test 39: Chat room membership events and disconnect cleanup
+        print("\n--- Test 39: Chat room membership events and disconnect cleanup ---")
+        try:
+            t39_passed = True
+            t39_details = []
+
+            s_b39 = BufferedSocket()
+            s_b39.connect((HOST, PORT))
+            s_b39.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob39", "id": "reg-b39"}) + "\n").encode('utf-8'))
+            s_b39.recv_line(timeout=2.0)
+
+            s_a39 = BufferedSocket()
+            s_a39.connect((HOST, PORT))
+            s_a39.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice39", "id": "reg-a39"}) + "\n").encode('utf-8'))
+            s_a39.recv_line(timeout=2.0)
+
+            s_b39.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-lounge", "room": "#lounge"}) + "\n").encode('utf-8'))
+            recv_matching(s_b39, ["room_create_resp"], timeout=2.0)
+
+            s_a39.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-lounge", "room": "#lounge"}) + "\n").encode('utf-8'))
+            recv_matching(s_a39, ["room_join_resp"], timeout=2.0)
+            joined_ev = recv_matching(s_b39, ["room_user_joined"], timeout=2.0)
+            if joined_ev and joined_ev.get("room") == "#lounge" and joined_ev.get("username") == "Alice39":
+                t39_details.append("39A (room_user_joined event verified) OK")
+            else:
+                t39_passed = False
+                t39_details.append(f"39A failed: {joined_ev}")
+
+            # Alice abruptly disconnects
+            s_a39.close()
+            time.sleep(0.1)
+
+            left_ev = recv_matching(s_b39, ["room_user_left"], timeout=2.0)
+            if left_ev and left_ev.get("room") == "#lounge" and left_ev.get("username") == "Alice39":
+                t39_details.append("39B (disconnect triggers room_user_left to remaining members) OK")
+            else:
+                t39_passed = False
+                t39_details.append(f"39B failed: {left_ev}")
+
+            s_b39.sendall((json.dumps({"version": 1, "type": "room_members_req", "id": "m-chk", "room": "#lounge"}) + "\n").encode('utf-8'))
+            m_chk = recv_matching(s_b39, ["room_members_resp"], timeout=2.0)
+            if m_chk and m_chk.get("members") == ["Bob39"]:
+                t39_details.append("39C (disconnected user removed from room members) OK")
+            else:
+                t39_passed = False
+                t39_details.append(f"39C failed: {m_chk}")
+
+            s_b39.close()
+
+            if t39_passed:
+                results["Test 39: Chat room membership events and disconnect cleanup"] = "Passed"
+                print(f"Test 39 PASSED: {'; '.join(t39_details)}")
+            else:
+                results["Test 39: Chat room membership events and disconnect cleanup"] = f"Failed ({'; '.join(t39_details)})"
+                print(f"Test 39 FAILED: {'; '.join(t39_details)}")
+        except Exception as e:
+            results["Test 39: Chat room membership events and disconnect cleanup"] = f"Failed ({e})"
+            print("Test 39 FAILED with exception:", e)
+
+        # Test 40: Chat room listing, member listing, and pagination
+        print("\n--- Test 40: Chat room listing, member listing, and pagination ---")
+        try:
+            t40_passed = True
+            t40_details = []
+
+            s_a40 = BufferedSocket()
+            s_a40.connect((HOST, PORT))
+            s_a40.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice40", "id": "reg-a40"}) + "\n").encode('utf-8'))
+            s_a40.recv_line(timeout=2.0)
+
+            s_b40 = BufferedSocket()
+            s_b40.connect((HOST, PORT))
+            s_b40.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob40", "id": "reg-b40"}) + "\n").encode('utf-8'))
+            s_b40.recv_line(timeout=2.0)
+
+            for rname in ["#r1", "#r2", "#r3"]:
+                s_a40.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": f"c-{rname}", "room": rname}) + "\n").encode('utf-8'))
+                recv_matching(s_a40, ["room_create_resp"], timeout=2.0)
+
+            s_b40.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-r1", "room": "#r1"}) + "\n").encode('utf-8'))
+            recv_matching(s_b40, ["room_join_resp"], timeout=2.0)
+
+            s_a40.sendall((json.dumps({"version": 1, "type": "room_list_req", "id": "rl-p1", "page": 1, "limit": 2}) + "\n").encode('utf-8'))
+            rl_p1 = recv_matching(s_a40, ["room_list_resp"], timeout=2.0)
+            if rl_p1 and rl_p1.get("count") == 2 and rl_p1.get("total_pages") >= 2:
+                t40_details.append("40A (room_list_req page 1 slice verified) OK")
+            else:
+                t40_passed = False
+                t40_details.append(f"40A failed: {rl_p1}")
+
+            s_a40.sendall((json.dumps({"version": 1, "type": "room_members_req", "id": "rm-p1", "room": "#r1", "page": 1, "limit": 1}) + "\n").encode('utf-8'))
+            rm_p1 = recv_matching(s_a40, ["room_members_resp"], timeout=2.0)
+            if rm_p1 and rm_p1.get("count") == 1 and rm_p1.get("total_members") == 2 and rm_p1.get("total_pages") == 2:
+                t40_details.append("40B (room_members_req pagination slice verified) OK")
+            else:
+                t40_passed = False
+                t40_details.append(f"40B failed: {rm_p1}")
+
+            s_a40.close()
+            s_b40.close()
+
+            if t40_passed:
+                results["Test 40: Chat room listing, member listing, and pagination"] = "Passed"
+                print(f"Test 40 PASSED: {'; '.join(t40_details)}")
+            else:
+                results["Test 40: Chat room listing, member listing, and pagination"] = f"Failed ({'; '.join(t40_details)})"
+                print(f"Test 40 FAILED: {'; '.join(t40_details)}")
+        except Exception as e:
+            results["Test 40: Chat room listing, member listing, and pagination"] = f"Failed ({e})"
+            print("Test 40 FAILED with exception:", e)
+
+        # Test 41: Chat room wire limit bounding
+        print("\n--- Test 41: Chat room wire limit bounding ---")
+        try:
+            t41_passed = True
+            t41_details = []
+
+            s_a41 = BufferedSocket()
+            s_a41.connect((HOST, PORT))
+            s_a41.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice41", "id": "reg-a41"}) + "\n").encode('utf-8'))
+            s_a41.recv_line(timeout=2.0)
+
+            s_b41 = BufferedSocket()
+            s_b41.connect((HOST, PORT))
+            s_b41.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob41", "id": "reg-b41"}) + "\n").encode('utf-8'))
+            s_b41.recv_line(timeout=2.0)
+
+            s_a41.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-w41", "room": "#wire41"}) + "\n").encode('utf-8'))
+            recv_matching(s_a41, ["room_create_resp"], timeout=2.0)
+
+            s_b41.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-w41", "room": "#wire41"}) + "\n").encode('utf-8'))
+            recv_matching(s_b41, ["room_join_resp"], timeout=2.0)
+            recv_matching(s_a41, ["room_user_joined"], timeout=2.0)
+
+            big_content = '"' * 980
+            s_a41.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "req-41-big", "room": "#wire41", "content": big_content}) + "\n").encode('utf-8'))
+            resp_41a = recv_matching(s_a41, ["error"], timeout=2.0)
+            b_leak = s_b41.recv_line(timeout=0.5)
+
+            if resp_41a and resp_41a.get("code") == "ERR_MESSAGE_TOO_LARGE" and (b_leak == "" or "type" not in b_leak):
+                t41_details.append("41A (oversized room message rejected with ERR_MESSAGE_TOO_LARGE; no peer leak) OK")
+            else:
+                t41_passed = False
+                t41_details.append(f"41A failed: resp={resp_41a}, b_leak='{b_leak}'")
+
+            s_a41.close()
+            s_b41.close()
+
+            if t41_passed:
+                results["Test 41: Chat room wire limit bounding"] = "Passed"
+                print(f"Test 41 PASSED: {'; '.join(t41_details)}")
+            else:
+                results["Test 41: Chat room wire limit bounding"] = f"Failed ({'; '.join(t41_details)})"
+                print(f"Test 41 FAILED: {'; '.join(t41_details)}")
+        except Exception as e:
+            results["Test 41: Chat room wire limit bounding"] = f"Failed ({e})"
+            print("Test 41 FAILED with exception:", e)
+
+        # Test 42: Concurrent room operations, private messaging, and thread safety under load
+        print("\n--- Test 42: Concurrent room operations and private messaging ---")
+        try:
+            con_errors = []
+            num_threads = 6
+
+            def worker_task(tid):
+                try:
+                    s = BufferedSocket()
+                    s.connect((HOST, PORT))
+                    uname = f"ConUser42_{tid}"
+                    s.sendall((json.dumps({"version": 1, "type": "register_req", "username": uname, "id": f"reg-{tid}"}) + "\n").encode('utf-8'))
+                    ack = recv_matching(s, ["register_ack"], timeout=3.0)
+                    if not ack or ack.get("username") != uname:
+                        con_errors.append(f"Thread {tid} reg failed: {ack}")
+                        s.close()
+                        return
+
+                    rname = f"#croom_{tid % 2}"
+                    if tid % 2 == 0:
+                        s.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": f"cr-{tid}", "room": rname}) + "\n").encode('utf-8'))
+                        recv_matching(s, ["room_create_resp", "error"], timeout=2.0)
+                    else:
+                        time.sleep(0.05)
+                        s.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": f"jn-{tid}", "room": rname}) + "\n").encode('utf-8'))
+                        recv_matching(s, ["room_join_resp", "error"], timeout=2.0)
+
+                    s.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": f"rm-{tid}", "room": rname, "content": f"Hi from {tid}"}) + "\n").encode('utf-8'))
+                    recv_matching(s, ["room_msg_ack", "error"], timeout=2.0)
+
+                    s.sendall((json.dumps({"version": 1, "type": "room_list_req", "id": f"rl-{tid}"}) + "\n").encode('utf-8'))
+                    recv_matching(s, ["room_list_resp"], timeout=2.0)
+
+                    time.sleep(0.05)
+                    s.close()
+                except Exception as ex:
+                    con_errors.append(f"Thread {tid} exception: {ex}")
+
+            th_list = []
+            for i in range(num_threads):
+                t = threading.Thread(target=worker_task, args=(i,))
+                th_list.append(t)
+                t.start()
+
+            for t in th_list:
+                t.join(timeout=6.0)
+
+            if len(con_errors) == 0:
+                results["Test 42: Concurrent room operations, private messaging, and thread safety"] = "Passed"
+                print(f"Test 42 PASSED: All {num_threads} concurrent threads completed successfully.")
+            else:
+                results["Test 42: Concurrent room operations, private messaging, and thread safety"] = f"Failed ({con_errors})"
+                print(f"Test 42 FAILED: {con_errors}")
+        except Exception as e:
+            results["Test 42: Concurrent room operations, private messaging, and thread safety"] = f"Failed ({e})"
+            print("Test 42 FAILED with exception:", e)
+
+        # Test 43: Cross-protocol isolation (legacy client compatibility)
+        print("\n--- Test 43: Cross-protocol isolation ---")
+        try:
+            t43_passed = True
+            t43_details = []
+
+            s_leg43 = BufferedSocket()
+            s_leg43.connect((HOST, PORT))
+            s_leg43.sendall(b"LegUser43\n")
+            leg_ack = s_leg43.recv_line(timeout=2.0)
+            assert leg_ack == "OK", f"Legacy reg failed: {leg_ack}"
+
+            s_a43 = BufferedSocket()
+            s_a43.connect((HOST, PORT))
+            s_a43.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Alice43", "id": "reg-a43"}) + "\n").encode('utf-8'))
+            s_a43.recv_line(timeout=2.0)
+
+            s_b43 = BufferedSocket()
+            s_b43.connect((HOST, PORT))
+            s_b43.sendall((json.dumps({"version": 1, "type": "register_req", "username": "Bob43", "id": "reg-b43"}) + "\n").encode('utf-8'))
+            s_b43.recv_line(timeout=2.0)
+
+            time.sleep(0.1)
+            while s_leg43.recv_line(timeout=0.2):
+                pass
+
+            # Alice sends private message to Bob
+            s_a43.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-43", "to": "Bob43", "content": "Private secret 43"}) + "\n").encode('utf-8'))
+            recv_matching(s_a43, ["msg_direct_ack"], timeout=2.0)
+            recv_matching(s_b43, ["msg_direct"], timeout=2.0)
+
+            # Alice creates room #secret43 and sends room message
+            s_a43.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-s43", "room": "#secret43"}) + "\n").encode('utf-8'))
+            recv_matching(s_a43, ["room_create_resp"], timeout=2.0)
+            s_b43.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-s43", "room": "#secret43"}) + "\n").encode('utf-8'))
+            recv_matching(s_b43, ["room_join_resp"], timeout=2.0)
+            recv_matching(s_a43, ["room_user_joined"], timeout=2.0)
+
+            s_a43.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "rm-43", "room": "#secret43", "content": "Room secret 43"}) + "\n").encode('utf-8'))
+            recv_matching(s_a43, ["room_msg_ack"], timeout=2.0)
+            recv_matching(s_b43, ["room_msg"], timeout=2.0)
+
+            leg_leak = s_leg43.recv_line(timeout=0.4)
+            if leg_leak == "" or ("Private secret" not in leg_leak and "Room secret" not in leg_leak):
+                t43_details.append("43A (zero private or room leakage to legacy client) OK")
+            else:
+                t43_passed = False
+                t43_details.append(f"43A failed: legacy got '{leg_leak}'")
+
+            s_a43.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "pub-43", "content": "Hello Public World!"}) + "\n").encode('utf-8'))
+            recv_matching(s_a43, ["msg_ack"], timeout=2.0)
+            b_pub = recv_matching(s_b43, ["msg_broadcast"], timeout=2.0)
+
+            leg_pub = s_leg43.recv_line(timeout=2.0)
+            if "[Alice43]: Hello Public World!" in leg_pub:
+                t43_details.append("43B (public broadcast received by legacy client) OK")
+            else:
+                t43_passed = False
+                t43_details.append(f"43B failed: leg_pub='{leg_pub}'")
+
+            s_leg43.close()
+            s_a43.close()
+            s_b43.close()
+
+            if t43_passed:
+                results["Test 43: Cross-protocol isolation (legacy client compatibility)"] = "Passed"
+                print(f"Test 43 PASSED: {'; '.join(t43_details)}")
+            else:
+                results["Test 43: Cross-protocol isolation (legacy client compatibility)"] = f"Failed ({'; '.join(t43_details)})"
+                print(f"Test 43 FAILED: {'; '.join(t43_details)}")
+        except Exception as e:
+            results["Test 43: Cross-protocol isolation (legacy client compatibility)"] = f"Failed ({e})"
+            print("Test 43 FAILED with exception:", e)
     finally:
         stop_server(srv_struct)
 

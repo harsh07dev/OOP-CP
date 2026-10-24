@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "client_manager.h"
+#include "room_manager.h"
 #include "logger.h"
 
 struct WorkerRecord {
@@ -64,6 +65,7 @@ private:
     sockaddr_in m_serverAddr; // Server address configuration
     Logger m_logger;          // Thread-safe timestamped logger
     ClientManager m_clientManager; // Thread-safe active client registry
+    RoomManager m_roomManager;     // Thread-safe room registry and membership
     std::atomic<bool> m_isRunning;
     std::atomic<bool> m_netInitialized;
 

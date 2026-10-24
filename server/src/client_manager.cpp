@@ -179,6 +179,27 @@ std::vector<ClientInfo> ClientManager::getAllClients() const {
     return m_clients;
 }
 
+std::vector<std::string> ClientManager::getOnlineUsernames() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<std::string> usernames;
+    usernames.reserve(m_clients.size());
+    for (const auto& client : m_clients) {
+        usernames.push_back(client.username);
+    }
+    return usernames;
+}
+
+bool ClientManager::getClientByUsername(const std::string& username, ClientInfo& outInfo) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& client : m_clients) {
+        if (equalsIgnoreCase(client.username, username)) {
+            outInfo = client;
+            return true;
+        }
+    }
+    return false;
+}
+
 void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSocket) {
     std::vector<ClientInfo> targets;
     Logger* logger = nullptr;

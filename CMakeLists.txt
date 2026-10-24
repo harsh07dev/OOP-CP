@@ -29,6 +29,7 @@ add_executable(chat_server
     server/src/main.cpp
     server/src/server.cpp
     server/src/client_manager.cpp
+    server/src/room_manager.cpp
     server/src/logger.cpp
 )
 target_include_directories(chat_server PRIVATE server/include common/include)

@@ -136,6 +136,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
     std::string registeredUsername;
     bool userRequestedQuit = false;
     protocol::ProtocolVersion clientProto = protocol::ProtocolVersion::LEGACY_V0;
+    ClientInfo myClientInfo;
 
     constexpr size_t RAW_BUFFER_SIZE = 1024;
     char rawBuffer[RAW_BUFFER_SIZE];
@@ -213,8 +214,20 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
 
                         if (reqMsg.type != protocol::TYPE_REGISTER_REQ) {
                             m_logger.warning("Structured registration rejected: expected register_req but got " + reqMsg.type + " from " + clientEndpoint);
+                            bool isOpRequiringReg = (reqMsg.type == protocol::TYPE_USER_LIST_REQ ||
+                                                     reqMsg.type == protocol::TYPE_MSG_DIRECT_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_CREATE_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_JOIN_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_LEAVE_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_LIST_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_MEMBERS_REQ ||
+                                                     reqMsg.type == protocol::TYPE_ROOM_MSG_REQ);
+                            std::string errCode = isOpRequiringReg ? std::string(protocol::ERR_NOT_REGISTERED)
+                                                                   : std::string(protocol::ERR_UNKNOWN_TYPE);
+                            std::string errDetail = isOpRequiringReg ? "Client must register before performing operations"
+                                                                     : "Expected register_req";
                             auto errResp = protocol::StructuredMessage::createError(
-                                protocol::ERR_UNKNOWN_TYPE, "Expected register_req", reqMsg.id);
+                                errCode, errDetail, reqMsg.id);
                             ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
                             shouldExit = true;
                             break;
@@ -250,6 +263,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                         // Registration succeeded
                         isRegistered = true;
                         registeredUsername = username;
+                        m_clientManager.getClientInfo(clientSocket, myClientInfo);
                         m_logger.info("User registered (Structured v1): " + registeredUsername + " (" + clientEndpoint + ")");
                         m_logger.info("User joined: " + registeredUsername);
 
@@ -301,6 +315,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                         // Registration succeeded
                         isRegistered = true;
                         registeredUsername = line;
+                        m_clientManager.getClientInfo(clientSocket, myClientInfo);
                         m_logger.info("User registered (Legacy v0): " + registeredUsername + " (" + clientEndpoint + ")");
                         m_logger.info("User joined: " + registeredUsername);
 
@@ -396,6 +411,394 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                         std::string legacyBroadcast = "[" + registeredUsername + "]: " + msg.content;
                         m_clientManager.broadcastStructured(structBroadcast, legacyBroadcast, clientSocket);
                     }
+                    else if (msg.type == protocol::TYPE_USER_LIST_REQ) {
+                        // Check validation errors (e.g. negative page or limit)
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            m_logger.warning("Invalid user_list_req from " + registeredUsername + ": " + valErr);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Snapshot active registered usernames under mutex (no network I/O under mutex)
+                        std::vector<std::string> activeUsers = m_clientManager.getOnlineUsernames();
+
+                        int page = (msg.page > 0) ? msg.page : 1;
+                        int limit = (msg.limit > 0) ? msg.limit : protocol::DEFAULT_USER_LIST_LIMIT;
+                        if (limit > protocol::MAX_USER_LIST_LIMIT) {
+                            limit = protocol::MAX_USER_LIST_LIMIT;
+                        }
+
+                        int totalUsers = static_cast<int>(activeUsers.size());
+                        int totalPages = (totalUsers + limit - 1) / limit;
+                        if (totalPages < 1) totalPages = 1;
+
+                        std::vector<std::string> pageUsers;
+                        int startIndex = (page - 1) * limit;
+                        if (startIndex < totalUsers) {
+                            int endIndex = std::min(startIndex + limit, totalUsers);
+                            for (int i = startIndex; i < endIndex; ++i) {
+                                pageUsers.push_back(activeUsers[i]);
+                            }
+                        }
+
+                        auto resp = protocol::StructuredMessage::createUserListResp(
+                            pageUsers, totalUsers, page, totalPages, msg.id);
+
+                        // Enforce wire limit
+                        if (resp.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            m_logger.warning("user_list_resp exceeds MAX_MESSAGE_SIZE (" +
+                                             std::to_string(resp.serializeWire().size()) + " > " +
+                                             std::to_string(protocol::MAX_MESSAGE_SIZE) + ") for " + registeredUsername);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE,
+                                "User list response exceeds wire limit; please request with a smaller page limit",
+                                msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+                    }
+                    else if (msg.type == protocol::TYPE_MSG_DIRECT_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            m_logger.warning("Invalid msg_direct_req from " + registeredUsername + ": " + valErr);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        if (!protocol::isValidUsername(msg.to)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_INVALID_USERNAME, "Invalid recipient username format", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        if (protocol::equalsIgnoreCase(registeredUsername, msg.to)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_CANNOT_MESSAGE_SELF, "Cannot send direct message to yourself", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        ClientInfo recipientInfo;
+                        if (!m_clientManager.getClientByUsername(msg.to, recipientInfo)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_RECIPIENT_NOT_FOUND, "Recipient '" + msg.to + "' is offline or does not exist", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        if (recipientInfo.protocolVersion != protocol::ProtocolVersion::STRUCTURED_V1) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_RECIPIENT_NOT_FOUND, "Recipient does not support private messaging", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+
+                        auto directMsg = protocol::StructuredMessage::createMsgDirect(
+                            registeredUsername, recipientInfo.username, msg.content, msgId, nowSec);
+
+                        if (directMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            m_logger.warning("Direct message from " + registeredUsername + " to " + recipientInfo.username +
+                                             " rejected: exceeds wire limit (" + std::to_string(directMsg.serializeWire().size()) + " bytes)");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Direct message envelope exceeds wire limit", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Deliver directly to recipient (outside global manager lock, serialized on recipient sendMutex)
+                        bool delivered = false;
+                        if (recipientInfo.sendMutex && recipientInfo.isClosed) {
+                            std::lock_guard<std::mutex> sLock(*recipientInfo.sendMutex);
+                            if (!recipientInfo.isClosed->load()) {
+                                delivered = ClientManager::sendAll(recipientInfo.socket, directMsg.serializeWire(), recipientInfo.username, &m_logger);
+                                if (!delivered) {
+                                    if (!recipientInfo.isClosed->exchange(true)) {
+                                        netShutdownSocket(recipientInfo.socket, NET_SHUTDOWN_RDWR);
+                                        netCloseSocket(recipientInfo.socket);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!delivered) {
+                            m_clientManager.removeClient(recipientInfo.socket);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_RECIPIENT_NOT_FOUND, "Recipient is no longer available", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Send msg_direct_ack to sender
+                        auto ack = protocol::StructuredMessage::createMsgDirectAck(msgId, recipientInfo.username, nowSec, msg.id);
+                        ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger);
+
+                        m_logger.info("Direct message delivered from " + registeredUsername + " to " + recipientInfo.username + " (msg_id: " + msgId + ")");
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_CREATE_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        RoomMember member;
+                        member.socket = clientSocket;
+                        member.username = registeredUsername;
+                        member.sendMutex = myClientInfo.sendMutex;
+                        member.isClosed = myClientInfo.isClosed;
+                        member.protocolVersion = clientProto;
+
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+
+                        std::string errCode, errMsg;
+                        if (!m_roomManager.createRoom(msg.room, registeredUsername, member, nowSec, errCode, errMsg)) {
+                            auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        m_logger.info("Room created: " + msg.room + " by " + registeredUsername);
+                        auto resp = protocol::StructuredMessage::createRoomCreateResp(msg.room, protocol::STATUS_OK, msg.id);
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_JOIN_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        RoomMember member;
+                        member.socket = clientSocket;
+                        member.username = registeredUsername;
+                        member.sendMutex = myClientInfo.sendMutex;
+                        member.isClosed = myClientInfo.isClosed;
+                        member.protocolVersion = clientProto;
+
+                        std::vector<RoomMember> peerTargets;
+                        std::string canonRoom;
+                        std::string errCode, errMsg;
+                        if (!m_roomManager.joinRoom(msg.room, member, peerTargets, canonRoom, errCode, errMsg)) {
+                            auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        m_logger.info("User " + registeredUsername + " joined room " + canonRoom);
+
+                        // Send join response to joining client
+                        auto resp = protocol::StructuredMessage::createRoomJoinResp(canonRoom, protocol::STATUS_OK, msg.id);
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+
+                        // Broadcast room_user_joined to existing room members
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        auto joinEvent = protocol::StructuredMessage::createRoomUserJoined(canonRoom, registeredUsername, nowSec);
+                        std::string joinWire = joinEvent.serializeWire();
+
+                        for (const auto& peer : peerTargets) {
+                            if (peer.sendMutex && peer.isClosed) {
+                                std::lock_guard<std::mutex> sLock(*peer.sendMutex);
+                                if (!peer.isClosed->load()) {
+                                    ClientManager::sendAll(peer.socket, joinWire, peer.username, &m_logger);
+                                }
+                            }
+                        }
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_LEAVE_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::vector<RoomMember> remainingTargets;
+                        std::string canonRoom;
+                        std::string errCode, errMsg;
+                        if (!m_roomManager.leaveRoom(msg.room, clientSocket, remainingTargets, canonRoom, errCode, errMsg)) {
+                            auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        m_logger.info("User " + registeredUsername + " left room " + canonRoom);
+
+                        // Send leave response to leaving client
+                        auto resp = protocol::StructuredMessage::createRoomLeaveResp(canonRoom, protocol::STATUS_OK, msg.id);
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+
+                        // Broadcast room_user_left to remaining members
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        auto leaveEvent = protocol::StructuredMessage::createRoomUserLeft(canonRoom, registeredUsername, nowSec);
+                        std::string leaveWire = leaveEvent.serializeWire();
+
+                        for (const auto& rem : remainingTargets) {
+                            if (rem.sendMutex && rem.isClosed) {
+                                std::lock_guard<std::mutex> sLock(*rem.sendMutex);
+                                if (!rem.isClosed->load()) {
+                                    ClientManager::sendAll(rem.socket, leaveWire, rem.username, &m_logger);
+                                }
+                            }
+                        }
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_MSG_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::vector<RoomMember> peerTargets;
+                        std::string canonRoom;
+                        std::string errCode, errMsg;
+                        if (!m_roomManager.getRoomPeers(msg.room, clientSocket, peerTargets, canonRoom, errCode, errMsg)) {
+                            auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+
+                        auto roomMsg = protocol::StructuredMessage::createRoomMsg(
+                            registeredUsername, canonRoom, msg.content, msgId, nowSec);
+
+                        if (roomMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            m_logger.warning("Room message from " + registeredUsername + " to " + canonRoom + " exceeds wire limit (" +
+                                             std::to_string(roomMsg.serializeWire().size()) + " > " + std::to_string(protocol::MAX_MESSAGE_SIZE) + ")");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Room message envelope exceeds wire limit", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Send room_msg_ack to sender
+                        auto ack = protocol::StructuredMessage::createRoomMsgAck(msgId, canonRoom, nowSec, msg.id);
+                        ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger);
+
+                        // Broadcast room message to room peers
+                        std::string roomWire = roomMsg.serializeWire();
+                        for (const auto& peer : peerTargets) {
+                            if (peer.sendMutex && peer.isClosed) {
+                                std::lock_guard<std::mutex> sLock(*peer.sendMutex);
+                                if (!peer.isClosed->load()) {
+                                    ClientManager::sendAll(peer.socket, roomWire, peer.username, &m_logger);
+                                }
+                            }
+                        }
+
+                        m_logger.chat("[" + registeredUsername + "@" + canonRoom + "]: " + msg.content);
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_LIST_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        auto activeRooms = m_roomManager.getRoomNames();
+                        int page = (msg.page > 0) ? msg.page : 1;
+                        int limit = (msg.limit > 0) ? msg.limit : protocol::DEFAULT_ROOM_LIST_LIMIT;
+                        if (limit > protocol::MAX_ROOM_LIST_LIMIT) {
+                            limit = protocol::MAX_ROOM_LIST_LIMIT;
+                        }
+
+                        int totalRooms = static_cast<int>(activeRooms.size());
+                        int totalPages = (totalRooms + limit - 1) / limit;
+                        if (totalPages < 1) totalPages = 1;
+
+                        std::vector<std::string> pageRooms;
+                        int startIndex = (page - 1) * limit;
+                        if (startIndex < totalRooms) {
+                            int endIndex = std::min(startIndex + limit, totalRooms);
+                            for (int i = startIndex; i < endIndex; ++i) {
+                                pageRooms.push_back(activeRooms[i]);
+                            }
+                        }
+
+                        auto resp = protocol::StructuredMessage::createRoomListResp(pageRooms, totalRooms, page, totalPages, msg.id);
+                        if (resp.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Room list response exceeds wire limit", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+                    }
+                    else if (msg.type == protocol::TYPE_ROOM_MEMBERS_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::vector<std::string> allMembers;
+                        std::string canonRoom;
+                        std::string errCode, errMsg;
+                        if (!m_roomManager.getRoomMemberNames(msg.room, clientSocket, allMembers, canonRoom, errCode, errMsg)) {
+                            auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        int page = (msg.page > 0) ? msg.page : 1;
+                        int limit = (msg.limit > 0) ? msg.limit : protocol::DEFAULT_ROOM_MEMBERS_LIMIT;
+                        if (limit > protocol::MAX_ROOM_MEMBERS_LIMIT) {
+                            limit = protocol::MAX_ROOM_MEMBERS_LIMIT;
+                        }
+
+                        int totalMembers = static_cast<int>(allMembers.size());
+                        int totalPages = (totalMembers + limit - 1) / limit;
+                        if (totalPages < 1) totalPages = 1;
+
+                        std::vector<std::string> pageMembers;
+                        int startIndex = (page - 1) * limit;
+                        if (startIndex < totalMembers) {
+                            int endIndex = std::min(startIndex + limit, totalMembers);
+                            for (int i = startIndex; i < endIndex; ++i) {
+                                pageMembers.push_back(allMembers[i]);
+                            }
+                        }
+
+                        auto resp = protocol::StructuredMessage::createRoomMembersResp(
+                            canonRoom, pageMembers, totalMembers, page, totalPages, msg.id);
+                        if (resp.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Room members response exceeds wire limit", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+                    }
                     else {
                         m_logger.warning("Unknown message type '" + msg.type + "' from " + registeredUsername);
                         auto errResp = protocol::StructuredMessage::createError(
@@ -456,11 +859,32 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
         }
     }
 
-    // Unregister client from ClientManager before broadcasting leave notification
+    // Unregister client from ClientManager and RoomManager before broadcasting leave notification
     if (isRegistered) {
         std::string departingUser = registeredUsername;
         bool removed = m_clientManager.removeClient(clientSocket);
         isRegistered = false;
+
+        // Clean up client from all chat rooms and broadcast room_user_left to remaining members
+        std::vector<RoomLeaveEvent> roomEvents;
+        m_roomManager.removeClientFromAllRooms(clientSocket, roomEvents);
+
+        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        for (const auto& rEvent : roomEvents) {
+            auto roomLeftMsg = protocol::StructuredMessage::createRoomUserLeft(
+                rEvent.roomName, departingUser, nowSec);
+            std::string roomLeftWire = roomLeftMsg.serializeWire();
+            for (const auto& remMember : rEvent.remainingMembers) {
+                if (remMember.sendMutex && remMember.isClosed) {
+                    std::lock_guard<std::mutex> sLock(*remMember.sendMutex);
+                    if (!remMember.isClosed->load()) {
+                        ClientManager::sendAll(remMember.socket, roomLeftWire, remMember.username, &m_logger);
+                    }
+                }
+            }
+        }
 
         if (removed) {
             if (userRequestedQuit) {
@@ -470,8 +894,6 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
             }
 
             // Broadcast leave notification to all remaining connected clients
-            int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
             std::string legacyLeave = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat.";
             auto structLeave = protocol::StructuredMessage::createSystemEvent(
                 protocol::EVENT_LEAVE, departingUser, legacyLeave, nowSec);

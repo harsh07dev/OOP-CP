@@ -22,14 +22,24 @@ struct StructuredMessage {
     std::string id;          // Client request or correlation ID
     std::string msgId;       // Server-assigned unique message ID
     std::string from;        // Sender username
-    std::string to;          // Recipient username (future private messaging)
-    std::string room;        // Room identifier (future chat rooms)
+    std::string to;          // Recipient username (private messaging)
+    std::string room;        // Room identifier (chat rooms)
     std::string content;     // Chat or announcement content
     std::string status;      // "ok" or "error"
     std::string code;        // Standardized status or error code
     std::string detail;      // Human-readable detail or explanation
     std::string event;       // System event category ("join", "leave", "system")
     std::string username;    // Subject username for registration / user events
+    std::vector<std::string> users;   // Active username list for user_list_resp
+    std::vector<std::string> rooms;   // Active room list for room_list_resp
+    std::vector<std::string> members; // Active member list for room_members_resp
+    int count{0};            // Number of items in this payload page
+    int totalUsers{0};       // Total online user count across all pages
+    int totalRooms{0};       // Total room count across all pages
+    int totalMembers{0};     // Total room member count across all pages
+    int page{0};             // Page number (1-indexed)
+    int limit{0};            // Page limit requested
+    int totalPages{0};       // Total pages calculated
     int64_t timestamp{0};    // UTC timestamp seconds since epoch
 
     // Serialize to compact single-line JSON string without delimiter
@@ -50,6 +60,43 @@ struct StructuredMessage {
         if (!event.empty()) obj.set("event", json::JsonValue(event));
         if (!username.empty()) obj.set("username", json::JsonValue(username));
         if (timestamp != 0) obj.set("timestamp", json::JsonValue(timestamp));
+
+        if (page > 0) obj.set("page", json::JsonValue(page));
+        if (limit > 0) obj.set("limit", json::JsonValue(limit));
+        if (totalPages > 0) obj.set("total_pages", json::JsonValue(totalPages));
+        if (totalUsers > 0) obj.set("total_users", json::JsonValue(totalUsers));
+        if (totalRooms > 0) obj.set("total_rooms", json::JsonValue(totalRooms));
+        if (totalMembers > 0) obj.set("total_members", json::JsonValue(totalMembers));
+
+        if (!users.empty() || type == TYPE_USER_LIST_RESP) {
+            json::JsonValue arr = json::JsonValue::array();
+            for (const auto& u : users) {
+                arr.arrVal.emplace_back(u);
+            }
+            obj.set("users", arr);
+            int64_t c = (count > 0) ? count : static_cast<int64_t>(users.size());
+            obj.set("count", json::JsonValue(c));
+        }
+
+        if (!rooms.empty() || type == TYPE_ROOM_LIST_RESP) {
+            json::JsonValue arr = json::JsonValue::array();
+            for (const auto& r : rooms) {
+                arr.arrVal.emplace_back(r);
+            }
+            obj.set("rooms", arr);
+            int64_t c = (count > 0) ? count : static_cast<int64_t>(rooms.size());
+            obj.set("count", json::JsonValue(c));
+        }
+
+        if (!members.empty() || type == TYPE_ROOM_MEMBERS_RESP) {
+            json::JsonValue arr = json::JsonValue::array();
+            for (const auto& m : members) {
+                arr.arrVal.emplace_back(m);
+            }
+            obj.set("members", arr);
+            int64_t c = (count > 0) ? count : static_cast<int64_t>(members.size());
+            obj.set("count", json::JsonValue(c));
+        }
 
         return obj.serialize();
     }
@@ -110,7 +157,18 @@ struct StructuredMessage {
             line.find("\"type\"") != std::string_view::npos ||
             line.find("'type'") != std::string_view::npos ||
             line.find("register_req") != std::string_view::npos ||
-            line.find("msg_send") != std::string_view::npos) {
+            line.find("msg_send") != std::string_view::npos ||
+            line.find("msg_direct") != std::string_view::npos ||
+            line.find("user_list_req") != std::string_view::npos ||
+            line.find("user_list_resp") != std::string_view::npos ||
+            line.find("user_joined") != std::string_view::npos ||
+            line.find("user_left") != std::string_view::npos ||
+            line.find("room_create") != std::string_view::npos ||
+            line.find("room_join") != std::string_view::npos ||
+            line.find("room_leave") != std::string_view::npos ||
+            line.find("room_list") != std::string_view::npos ||
+            line.find("room_members") != std::string_view::npos ||
+            line.find("room_msg") != std::string_view::npos) {
             return true;
         }
         return false;
@@ -159,6 +217,50 @@ struct StructuredMessage {
         outMsg.event = root.getString("event");
         outMsg.username = root.getString("username");
         outMsg.timestamp = root.getInt("timestamp", 0);
+
+        outMsg.page = static_cast<int>(root.getInt("page", 0));
+        outMsg.limit = static_cast<int>(root.getInt("limit", 0));
+        outMsg.totalPages = static_cast<int>(root.getInt("total_pages", 0));
+        outMsg.totalUsers = static_cast<int>(root.getInt("total_users", 0));
+        outMsg.totalRooms = static_cast<int>(root.getInt("total_rooms", 0));
+        outMsg.totalMembers = static_cast<int>(root.getInt("total_members", 0));
+        outMsg.count = static_cast<int>(root.getInt("count", 0));
+
+        const auto& usersVal = root.get("users");
+        if (usersVal.isArray()) {
+            for (const auto& item : usersVal.arrVal) {
+                if (item.isString()) {
+                    outMsg.users.push_back(item.strVal);
+                }
+            }
+        }
+        if (outMsg.count == 0 && !outMsg.users.empty()) {
+            outMsg.count = static_cast<int>(outMsg.users.size());
+        }
+
+        const auto& roomsVal = root.get("rooms");
+        if (roomsVal.isArray()) {
+            for (const auto& item : roomsVal.arrVal) {
+                if (item.isString()) {
+                    outMsg.rooms.push_back(item.strVal);
+                }
+            }
+        }
+        if (outMsg.count == 0 && !outMsg.rooms.empty()) {
+            outMsg.count = static_cast<int>(outMsg.rooms.size());
+        }
+
+        const auto& membersVal = root.get("members");
+        if (membersVal.isArray()) {
+            for (const auto& item : membersVal.arrVal) {
+                if (item.isString()) {
+                    outMsg.members.push_back(item.strVal);
+                }
+            }
+        }
+        if (outMsg.count == 0 && !outMsg.members.empty()) {
+            outMsg.count = static_cast<int>(outMsg.members.size());
+        }
 
         return true;
     }
@@ -211,9 +313,96 @@ struct StructuredMessage {
                 outErr = "Broadcast message requires 'content'";
                 return false;
             }
+        } else if (type == TYPE_MSG_DIRECT_REQ) {
+            if (to.empty()) {
+                outErr = "Direct message requires 'to' recipient";
+                return false;
+            }
+            if (content.empty()) {
+                outErr = "Direct message content cannot be empty";
+                return false;
+            }
+        } else if (type == TYPE_MSG_DIRECT) {
+            if (from.empty() || to.empty()) {
+                outErr = "Direct message requires 'from' and 'to'";
+                return false;
+            }
+            if (content.empty()) {
+                outErr = "Direct message requires 'content'";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_CREATE_REQ) {
+            if (room.empty()) {
+                outErr = "Room creation requires 'room' name";
+                return false;
+            }
+            if (!isValidRoomName(room)) {
+                outErr = "Invalid room name format";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_JOIN_REQ) {
+            if (room.empty()) {
+                outErr = "Room join requires 'room' name";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_LEAVE_REQ) {
+            if (room.empty()) {
+                outErr = "Room leave requires 'room' name";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_MSG_REQ) {
+            if (room.empty()) {
+                outErr = "Room message requires 'room' name";
+                return false;
+            }
+            if (content.empty()) {
+                outErr = "Room message content cannot be empty";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_LIST_REQ) {
+            if (page < 0) {
+                outErr = "Page number cannot be negative";
+                return false;
+            }
+            if (limit < 0) {
+                outErr = "Limit cannot be negative";
+                return false;
+            }
+        } else if (type == TYPE_ROOM_MEMBERS_REQ) {
+            if (room.empty()) {
+                outErr = "Room members request requires 'room' name";
+                return false;
+            }
+            if (page < 0) {
+                outErr = "Page number cannot be negative";
+                return false;
+            }
+            if (limit < 0) {
+                outErr = "Limit cannot be negative";
+                return false;
+            }
         } else if (type == TYPE_SYSTEM_EVENT) {
             if (event.empty()) {
                 outErr = "System event requires 'event' category";
+                return false;
+            }
+        } else if (type == TYPE_USER_LIST_REQ) {
+            if (page < 0) {
+                outErr = "Page number cannot be negative";
+                return false;
+            }
+            if (limit < 0) {
+                outErr = "Limit cannot be negative";
+                return false;
+            }
+        } else if (type == TYPE_USER_LIST_RESP) {
+            if (status != STATUS_OK) {
+                outErr = "User list response requires status 'ok'";
+                return false;
+            }
+        } else if (type == TYPE_USER_JOINED || type == TYPE_USER_LEFT) {
+            if (username.empty()) {
+                outErr = "User join/leave event requires non-empty 'username'";
                 return false;
             }
         } else if (type == TYPE_ERROR) {
@@ -275,6 +464,190 @@ struct StructuredMessage {
         return m;
     }
 
+    static StructuredMessage createMsgDirectReq(std::string_view to, std::string_view content, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_MSG_DIRECT_REQ);
+        m.to = std::string(to);
+        m.content = std::string(content);
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createMsgDirectAck(std::string_view msgId, std::string_view to, int64_t timestamp, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_MSG_DIRECT_ACK);
+        m.status = std::string(STATUS_OK);
+        m.msgId = std::string(msgId);
+        m.to = std::string(to);
+        m.timestamp = timestamp;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createMsgDirect(std::string_view from, std::string_view to, std::string_view content, std::string_view msgId, int64_t timestamp) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_MSG_DIRECT);
+        m.from = std::string(from);
+        m.to = std::string(to);
+        m.content = std::string(content);
+        m.msgId = std::string(msgId);
+        m.timestamp = timestamp;
+        return m;
+    }
+
+    static StructuredMessage createRoomCreateReq(std::string_view room, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_CREATE_REQ);
+        m.room = std::string(room);
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomCreateResp(std::string_view room, std::string_view status = STATUS_OK, std::string_view id = "", std::string_view detail = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_CREATE_RESP);
+        m.room = std::string(room);
+        m.status = std::string(status);
+        m.id = std::string(id);
+        m.detail = std::string(detail);
+        return m;
+    }
+
+    static StructuredMessage createRoomJoinReq(std::string_view room, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_JOIN_REQ);
+        m.room = std::string(room);
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomJoinResp(std::string_view room, std::string_view status = STATUS_OK, std::string_view id = "", std::string_view detail = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_JOIN_RESP);
+        m.room = std::string(room);
+        m.status = std::string(status);
+        m.id = std::string(id);
+        m.detail = std::string(detail);
+        return m;
+    }
+
+    static StructuredMessage createRoomLeaveReq(std::string_view room, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_LEAVE_REQ);
+        m.room = std::string(room);
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomLeaveResp(std::string_view room, std::string_view status = STATUS_OK, std::string_view id = "", std::string_view detail = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_LEAVE_RESP);
+        m.room = std::string(room);
+        m.status = std::string(status);
+        m.id = std::string(id);
+        m.detail = std::string(detail);
+        return m;
+    }
+
+    static StructuredMessage createRoomListReq(std::string_view id = "", int page = 1, int limit = DEFAULT_ROOM_LIST_LIMIT) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_LIST_REQ);
+        m.id = std::string(id);
+        m.page = page;
+        m.limit = limit;
+        return m;
+    }
+
+    static StructuredMessage createRoomListResp(const std::vector<std::string>& roomList, int totalRooms, int page, int totalPages, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_LIST_RESP);
+        m.status = std::string(STATUS_OK);
+        m.rooms = roomList;
+        m.count = static_cast<int>(roomList.size());
+        m.totalRooms = totalRooms;
+        m.page = page;
+        m.totalPages = totalPages;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomMembersReq(std::string_view room, std::string_view id = "", int page = 1, int limit = DEFAULT_ROOM_MEMBERS_LIMIT) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_MEMBERS_REQ);
+        m.room = std::string(room);
+        m.id = std::string(id);
+        m.page = page;
+        m.limit = limit;
+        return m;
+    }
+
+    static StructuredMessage createRoomMembersResp(std::string_view room, const std::vector<std::string>& memberList, int totalMembers, int page, int totalPages, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_MEMBERS_RESP);
+        m.status = std::string(STATUS_OK);
+        m.room = std::string(room);
+        m.members = memberList;
+        m.count = static_cast<int>(memberList.size());
+        m.totalMembers = totalMembers;
+        m.page = page;
+        m.totalPages = totalPages;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomMsgReq(std::string_view room, std::string_view content, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_MSG_REQ);
+        m.room = std::string(room);
+        m.content = std::string(content);
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomMsgAck(std::string_view msgId, std::string_view room, int64_t timestamp, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_MSG_ACK);
+        m.status = std::string(STATUS_OK);
+        m.msgId = std::string(msgId);
+        m.room = std::string(room);
+        m.timestamp = timestamp;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createRoomMsg(std::string_view from, std::string_view room, std::string_view content, std::string_view msgId, int64_t timestamp) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_MSG);
+        m.from = std::string(from);
+        m.room = std::string(room);
+        m.content = std::string(content);
+        m.msgId = std::string(msgId);
+        m.timestamp = timestamp;
+        return m;
+    }
+
+    static StructuredMessage createRoomUserJoined(std::string_view room, std::string_view username, int64_t timestamp = 0) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_USER_JOINED);
+        m.room = std::string(room);
+        m.username = std::string(username);
+        m.event = std::string(EVENT_JOIN);
+        m.timestamp = timestamp;
+        m.detail = "[Room] " + std::string(username) + " has joined " + std::string(room) + ".";
+        return m;
+    }
+
+    static StructuredMessage createRoomUserLeft(std::string_view room, std::string_view username, int64_t timestamp = 0) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_ROOM_USER_LEFT);
+        m.room = std::string(room);
+        m.username = std::string(username);
+        m.event = std::string(EVENT_LEAVE);
+        m.timestamp = timestamp;
+        m.detail = "[Room] " + std::string(username) + " has left " + std::string(room) + ".";
+        return m;
+    }
+
     static StructuredMessage createSystemEvent(std::string_view event, std::string_view username, std::string_view detail, int64_t timestamp) {
         StructuredMessage m;
         m.type = std::string(TYPE_SYSTEM_EVENT);
@@ -300,6 +673,56 @@ struct StructuredMessage {
         m.detail = std::string(detail);
         m.id = std::string(id);
         return m;
+    }
+
+    static StructuredMessage createUserListReq(std::string_view id = "", int page = 1, int limit = DEFAULT_USER_LIST_LIMIT) {
+        StructuredMessage m;
+        m.type = std::string(TYPE_USER_LIST_REQ);
+        m.id = std::string(id);
+        m.page = page;
+        m.limit = limit;
+        return m;
+    }
+
+    static StructuredMessage createUserListResp(const std::vector<std::string>& userList, int totalUsers, int page, int totalPages, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_USER_LIST_RESP);
+        m.status = std::string(STATUS_OK);
+        m.users = userList;
+        m.count = static_cast<int>(userList.size());
+        m.totalUsers = totalUsers;
+        m.page = page;
+        m.totalPages = totalPages;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createUserJoined(std::string_view username, int64_t timestamp = 0, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_USER_JOINED);
+        m.username = std::string(username);
+        m.event = std::string(EVENT_JOIN);
+        m.timestamp = timestamp;
+        m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createUserLeft(std::string_view username, int64_t timestamp = 0, std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_USER_LEFT);
+        m.username = std::string(username);
+        m.event = std::string(EVENT_LEAVE);
+        m.timestamp = timestamp;
+        m.id = std::string(id);
+        return m;
+    }
+
+    bool isUserJoinEvent() const noexcept {
+        return type == TYPE_USER_JOINED || (type == TYPE_SYSTEM_EVENT && event == EVENT_JOIN);
+    }
+
+    bool isUserLeaveEvent() const noexcept {
+        return type == TYPE_USER_LEFT || (type == TYPE_SYSTEM_EVENT && event == EVENT_LEAVE);
     }
 };
 
