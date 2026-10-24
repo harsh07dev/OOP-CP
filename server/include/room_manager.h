@@ -24,6 +24,7 @@ struct RoomMember {
 };
 
 struct Room {
+    int64_t instanceId{0};     // Stable, unique room instance ID for persistence isolation
     std::string name;          // Preserves creator's casing for display
     std::string creator;       // Username of creator
     int64_t createdAt{0};      // Timestamp
@@ -43,6 +44,13 @@ public:
     RoomManager(const RoomManager&) = delete;
     RoomManager& operator=(const RoomManager&) = delete;
 
+    // Synchronize instance sequence from storage on startup
+    void initNextInstanceId(int64_t nextId) {
+        if (nextId > m_nextInstanceId.load()) {
+            m_nextInstanceId.store(nextId);
+        }
+    }
+
     // Create a new room with creator auto-joined as first member
     bool createRoom(const std::string& roomName, const std::string& creatorUsername,
                     const RoomMember& creatorMember, int64_t timestamp,
@@ -58,18 +66,24 @@ public:
                    std::vector<RoomMember>& outRemainingTargets, std::string& outCanonicalRoom,
                    std::string& outErrCode, std::string& outErrMsg);
 
-    // Get room members for messaging (excluding the sender)
+    // Get room members for messaging (excluding the sender) and retrieve current room instance ID
     bool getRoomPeers(const std::string& roomName, SOCKET senderSocket,
                       std::vector<RoomMember>& outPeerTargets, std::string& outCanonicalRoom,
+                      int64_t& outInstanceId,
                       std::string& outErrCode, std::string& outErrMsg) const;
-
-    // Get list of active rooms
-    std::vector<std::string> getRoomNames() const;
 
     // Get member usernames of a room (requester must be an authorized member)
     bool getRoomMemberNames(const std::string& roomName, SOCKET requesterSocket,
                             std::vector<std::string>& outMembers, std::string& outCanonicalRoom,
                             std::string& outErrCode, std::string& outErrMsg) const;
+
+    // Retrieve active instance ID for a room if requester is an active member
+    bool getRoomInstanceId(const std::string& roomName, SOCKET requesterSocket,
+                           int64_t& outInstanceId, std::string& outCanonicalRoom,
+                           std::string& outErrCode, std::string& outErrMsg) const;
+
+    // Get list of active rooms
+    std::vector<std::string> getRoomNames() const;
 
     // Remove client from all rooms on disconnect (empty rooms automatically deleted)
     void removeClientFromAllRooms(SOCKET socket, std::vector<RoomLeaveEvent>& outEvents);
@@ -83,6 +97,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     std::vector<Room> m_rooms;
+    std::atomic<int64_t> m_nextInstanceId{1};
 
     std::vector<Room>::iterator findRoomIter(std::string_view roomName);
     std::vector<Room>::const_iterator findRoomIter(std::string_view roomName) const;

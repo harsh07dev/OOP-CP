@@ -69,11 +69,18 @@ inline constexpr std::string_view TYPE_ROOM_MSG_ACK     = "room_msg_ack";
 inline constexpr std::string_view TYPE_ROOM_MSG         = "room_msg";
 inline constexpr std::string_view TYPE_ROOM_USER_JOINED = "room_user_joined";
 inline constexpr std::string_view TYPE_ROOM_USER_LEFT   = "room_user_left";
+inline constexpr std::string_view TYPE_HISTORY_REQ      = "history_req";
+inline constexpr std::string_view TYPE_HISTORY_RESP     = "history_resp";
 inline constexpr std::string_view TYPE_SYSTEM_EVENT    = "system_event";
 inline constexpr std::string_view TYPE_DISCONNECT_REQ  = "disconnect_req";
 inline constexpr std::string_view TYPE_ERROR           = "error";
 
-// User list and room pagination defaults and limits
+// Conversation types for history
+inline constexpr std::string_view CONV_PUBLIC = "public";
+inline constexpr std::string_view CONV_DIRECT = "direct";
+inline constexpr std::string_view CONV_ROOM   = "room";
+
+// User list, room, and history pagination defaults and limits
 inline constexpr int DEFAULT_USER_LIST_LIMIT = 50;
 inline constexpr int MAX_USER_LIST_LIMIT     = 50;
 inline constexpr std::size_t MAX_ROOM_NAME_LENGTH = 32;
@@ -81,6 +88,8 @@ inline constexpr int DEFAULT_ROOM_LIST_LIMIT = 50;
 inline constexpr int MAX_ROOM_LIST_LIMIT     = 50;
 inline constexpr int DEFAULT_ROOM_MEMBERS_LIMIT = 50;
 inline constexpr int MAX_ROOM_MEMBERS_LIMIT     = 50;
+inline constexpr int DEFAULT_HISTORY_LIMIT   = 20;
+inline constexpr int MAX_HISTORY_LIMIT       = 50;
 
 // Status identifiers
 inline constexpr std::string_view STATUS_OK    = "ok";
@@ -109,6 +118,9 @@ inline constexpr std::string_view ERR_ROOM_ALREADY_EXISTS = "ERR_ROOM_ALREADY_EX
 inline constexpr std::string_view ERR_ROOM_NOT_FOUND      = "ERR_ROOM_NOT_FOUND";
 inline constexpr std::string_view ERR_NOT_IN_ROOM         = "ERR_NOT_IN_ROOM";
 inline constexpr std::string_view ERR_ALREADY_IN_ROOM     = "ERR_ALREADY_IN_ROOM";
+inline constexpr std::string_view ERR_STORAGE_ERROR       = "ERR_STORAGE_ERROR";
+inline constexpr std::string_view ERR_UNAUTHORIZED        = "ERR_UNAUTHORIZED";
+inline constexpr std::string_view ERR_INVALID_CONVERSATION= "ERR_INVALID_CONVERSATION";
 
 // Case-insensitive string comparison helper
 inline bool equalsIgnoreCase(std::string_view a, std::string_view b) noexcept {

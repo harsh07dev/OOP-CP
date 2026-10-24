@@ -1102,3 +1102,52 @@ All 43 integration and unit scenarios executed cleanly:
 - **Chat Room Tests (36–42)**: Creation, case-insensitivity, duplicate rejection, join/leave, empty room auto-deletion, member-only messaging, non-member rejection, sender ACK policy, membership events, disconnect cleanup, pagination, wire bounding, and high concurrency verified.
 - **Cross-Protocol Isolation Test (43)**: Verified that legacy clients never receive private or room messages.
 
+---
+
+## 20. Phase 4 — Task 4: SQLite-Backed Persistent Message History
+
+### 20.1 Scope and Deliverables
+Phase 4 Task 4 introduces SQLite-backed message history persistence for public chat, direct messages, and chat rooms. It defines a structured history protocol (`history_req`/`history_resp`) supporting authorized, paginated, cursor-based retrieval across server restarts while preserving live messaging behavior, legacy compatibility, and the strict 2048-byte wire frame limit.
+
+### 20.2 Files Created and Modified
+| File | Action | Purpose |
+|---|---|---|
+| [`common/include/protocol.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol.h) | Modified | Added history message types (`history_req`, `history_resp`), conversation types (`public`, `direct`, `room`), history limit constants (default 20, max 50), and error codes (`ERR_STORAGE_ERROR`, `ERR_UNAUTHORIZED`, `ERR_INVALID_CONVERSATION`). |
+| [`common/include/protocol_message.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol_message.h) | Modified | Added `HistoryItem` struct, history fields to `StructuredMessage`, history JSON serialization/deserialization, protocol detection heuristic updates, semantic validation rules, and message factories. |
+| [`server/include/message_store.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/message_store.h) | Created | Header for thread-safe SQLite persistence layer (`MessageStore`), defining DDL schemas, prepared statements, transactions, high-water mark sequence resumption, and cursor query APIs. |
+| [`server/src/message_store.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/message_store.cpp) | Created | Implementation of `MessageStore`: WAL mode, prepared statement caching, direct pair sorting, room instance isolation, and cursor-based history retrieval (`before_id` and `after_id`). |
+| [`server/include/room_manager.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/room_manager.h) | Modified | Added `instanceId` tracking to `Room` structure, `initNextInstanceId()`, and room instance resolution API for history authorization. |
+| [`server/src/room_manager.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/room_manager.cpp) | Modified | Increments `instanceId` per room creation, ensuring room name re-use assigns a distinct identity that isolates historical messages. |
+| [`server/include/server.h`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/server.h) | Modified | Integrated `MessageStore m_messageStore` into `Server` with configurable database path. |
+| [`server/src/server.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp) | Modified | Integrated commit-before-ACK semantics across public, direct, and room message dispatch; implemented `history_req` dispatch with authorization checks and 2048-byte dynamic wire packing. |
+| [`server/src/main.cpp`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/main.cpp) | Modified | Added database path CLI parameter parsing: `chat_server [port] [db_path]`. |
+| [`CMakeLists.txt`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/CMakeLists.txt) | Modified | Added `find_package(SQLite3 REQUIRED)`, added `server/src/message_store.cpp` to target, linked `SQLite::SQLite3`. |
+| [`tests/regression_tests.py`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) | Modified | Added `-lsqlite3` and `message_store.cpp` to compiler test; isolated test database per run; added Tests 44–55 covering all 18 specified persistence scenarios. |
+| [`docs/PROTOCOL_SPECIFICATION.md`](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/docs/PROTOCOL_SPECIFICATION.md) | Modified | Added Section 4.14 Persistent Message History, updated standard error codes, architectural documentation, and full 55-test verification matrix. |
+
+### 20.3 SQLite Storage Architecture & Invariants
+- **Database Schema**:
+  - `messages` table: `id` (INTEGER PRIMARY KEY), `msg_id` (TEXT UNIQUE NOT NULL), `conv_type` (TEXT), `sender` (TEXT), `recipient` (TEXT), `direct_pair` (TEXT), `room_name` (TEXT), `room_instance_id` (INTEGER), `content` (TEXT), `created_at` (INTEGER).
+  - Indexes: `idx_messages_public` on `(conv_type, id ASC)`, `idx_messages_direct` on `(conv_type, direct_pair, id ASC)`, `idx_messages_room` on `(conv_type, room_instance_id, id ASC)`.
+- **Durable Collision-Free IDs**: Sequence counters resume upon startup from `SELECT COALESCE(MAX(id), 0) FROM messages`, ensuring durable, monotonically increasing `msg-<id>` values across server restarts.
+- **Commit-Before-ACK**: Success acknowledgements (`msg_ack`, `msg_direct_ack`, `room_msg_ack`) and broadcasts are dispatched strictly AFTER SQLite commit. Persistence failures abort broadcasts and return `ERR_STORAGE_ERROR`.
+- **Zero Lock Coupling**: Database I/O is held strictly under `MessageStore::m_mutex`. Socket descriptors and client/room manager mutexes are never held during SQLite queries.
+- **Room History Isolation**: Each created room receives an incrementing `room_instance_id`. When an ephemeral room is auto-deleted upon becoming empty, recreating a room with the same name generates a new instance ID, permanently isolating historical messages between separate incarnations of the room name.
+- **Wire Bounding Under History Retrieval**: History responses pack complete `HistoryItem` records dynamically up to 2048 bytes; if a subsequent message would push the envelope over 2048 bytes, packing stops, `has_more` is set to `true`, and the frame is transmitted without JSON truncation.
+
+### 20.4 Regression Test Verification (55/55 Passing)
+All 55 integration and unit scenarios executed cleanly on Windows 11 with MinGW UCRT64 GCC 16.1.0:
+- **Tests 1–43**: Fully preserved existing legacy and structured regression suite.
+- **Test 44**: Public history retrieval, chronological ordering, empty history handling, and legacy client message persistence.
+- **Test 45**: Direct message persistence, bi-directional authorized retrieval, and third-party isolation (Charlie receives 0 messages).
+- **Test 46**: Room message persistence, membership authorization, and non-member/former-member rejection (`ERR_NOT_IN_ROOM`).
+- **Test 47**: Full server shutdown and restart with persistent messages and monotonic sequence resumption.
+- **Test 48**: Deterministic cursor-based pagination (`before_id` and `after_id`) returning all messages in order with zero duplicates and zero omissions.
+- **Test 49**: Parameter validation (invalid conversation types, missing fields, self-messaging rejection, limit clamping).
+- **Test 50**: Escaped characters, quotes, backslashes, and multibyte UTF-8 round-tripping identically.
+- **Test 51**: Oversized history response obeying the strict 2048-byte wire frame limit with `has_more: true`.
+- **Test 52**: Room name reuse historical isolation (recreating empty room does not expose previous incarnation's messages).
+- **Test 53**: Storage failure handling (`CHAT_SIMULATE_STORAGE_FAILURE=1`) preventing false ACK and false broadcast.
+- **Test 54**: High-concurrency public, direct, and room message storage integrity across 6 simultaneous threads.
+- **Test 55**: Disconnect resilience: delivery failure after database commit does not erase the message.
+

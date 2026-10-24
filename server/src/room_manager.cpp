@@ -32,6 +32,7 @@ bool RoomManager::createRoom(const std::string& roomName, const std::string& cre
     }
 
     Room r;
+    r.instanceId = m_nextInstanceId.fetch_add(1);
     r.name = roomName;
     r.creator = creatorUsername;
     r.createdAt = timestamp;
@@ -110,6 +111,7 @@ bool RoomManager::leaveRoom(const std::string& roomName, SOCKET socket,
 
 bool RoomManager::getRoomPeers(const std::string& roomName, SOCKET senderSocket,
                                std::vector<RoomMember>& outPeerTargets, std::string& outCanonicalRoom,
+                               int64_t& outInstanceId,
                                std::string& outErrCode, std::string& outErrMsg) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = findRoomIter(roomName);
@@ -133,6 +135,7 @@ bool RoomManager::getRoomPeers(const std::string& roomName, SOCKET senderSocket,
         return false;
     }
 
+    outInstanceId = it->instanceId;
     outCanonicalRoom = it->name;
     outPeerTargets.reserve(it->members.size());
     for (const auto& m : it->members) {
@@ -141,6 +144,36 @@ bool RoomManager::getRoomPeers(const std::string& roomName, SOCKET senderSocket,
         }
     }
 
+    return true;
+}
+
+bool RoomManager::getRoomInstanceId(const std::string& roomName, SOCKET requesterSocket,
+                                   int64_t& outInstanceId, std::string& outCanonicalRoom,
+                                   std::string& outErrCode, std::string& outErrMsg) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = findRoomIter(roomName);
+    if (it == m_rooms.end()) {
+        outErrCode = std::string(protocol::ERR_ROOM_NOT_FOUND);
+        outErrMsg = "Room '" + roomName + "' does not exist";
+        return false;
+    }
+
+    bool isMember = false;
+    for (const auto& m : it->members) {
+        if (m.socket == requesterSocket) {
+            isMember = true;
+            break;
+        }
+    }
+
+    if (!isMember) {
+        outErrCode = std::string(protocol::ERR_NOT_IN_ROOM);
+        outErrMsg = "You are not a member of room '" + it->name + "'";
+        return false;
+    }
+
+    outInstanceId = it->instanceId;
+    outCanonicalRoom = it->name;
     return true;
 }
 

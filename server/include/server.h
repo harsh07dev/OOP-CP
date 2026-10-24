@@ -13,6 +13,7 @@
 
 #include "client_manager.h"
 #include "room_manager.h"
+#include "message_store.h"
 #include "logger.h"
 
 struct WorkerRecord {
@@ -24,7 +25,7 @@ struct WorkerRecord {
 
 class Server {
 public:
-    explicit Server(int port = 8080);
+    explicit Server(int port = 8080, std::string dbPath = "chat_history.db");
     ~Server();
 
     // Disable copy semantics to prevent duplicate socket ownership issues
@@ -46,6 +47,9 @@ public:
     // Returns the port the server is configured to listen on
     int getPort() const;
 
+    // Direct access to storage for testing/diagnostics
+    MessageStore& getMessageStore() { return m_messageStore; }
+
 private:
     // Core TCP sequence steps
     bool initializeSocket();
@@ -66,6 +70,7 @@ private:
     Logger m_logger;          // Thread-safe timestamped logger
     ClientManager m_clientManager; // Thread-safe active client registry
     RoomManager m_roomManager;     // Thread-safe room registry and membership
+    MessageStore m_messageStore;   // Thread-safe SQLite persistence store
     std::atomic<bool> m_isRunning;
     std::atomic<bool> m_netInitialized;
 

@@ -49,7 +49,7 @@ namespace {
 #endif
 }
 
-int main() {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // Register Windows console control and signal handlers
     std::signal(SIGINT, handleSignal);
@@ -67,10 +67,22 @@ int main() {
     std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE so broken client sockets do not terminate server
 #endif
 
-    constexpr int SERVER_PORT = 8080;
+    int serverPort = 8080;
+    std::string dbPath = "chat_history.db";
 
-    // 1. Create Server instance on port 8080
-    Server server(SERVER_PORT);
+    if (argc > 1) {
+        try {
+            serverPort = std::stoi(argv[1]);
+        } catch (...) {
+            serverPort = 8080;
+        }
+    }
+    if (argc > 2) {
+        dbPath = argv[2];
+    }
+
+    // 1. Create Server instance on configured port and database path
+    Server server(serverPort, dbPath);
     g_serverInstance = &server;
 
     // 2. Start server sequence: socket() -> bind() -> listen()

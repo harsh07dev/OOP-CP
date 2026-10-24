@@ -14,6 +14,9 @@ endif()
 # Threading library
 find_package(Threads REQUIRED)
 
+# SQLite3 library for persistence
+find_package(SQLite3 REQUIRED)
+
 # Platform-specific socket libraries
 if(WIN32)
     set(PLATFORM_NETWORK_LIBS ws2_32)
@@ -30,10 +33,11 @@ add_executable(chat_server
     server/src/server.cpp
     server/src/client_manager.cpp
     server/src/room_manager.cpp
+    server/src/message_store.cpp
     server/src/logger.cpp
 )
 target_include_directories(chat_server PRIVATE server/include common/include)
-target_link_libraries(chat_server PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS})
+target_link_libraries(chat_server PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS} SQLite::SQLite3)
 
 # Client executable target
 add_executable(chat_client

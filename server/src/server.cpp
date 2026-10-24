@@ -11,11 +11,13 @@
 #include <cstdint>
 #include <chrono>
 
-Server::Server(int port)
+Server::Server(int port, std::string dbPath)
     : m_port(port),
       m_serverSocket(INVALID_SOCKET),
       m_logger("logs/chat.log"),
       m_clientManager(&m_logger),
+      m_roomManager(),
+      m_messageStore(std::move(dbPath)),
       m_isRunning(false),
       m_netInitialized(false)
 {
@@ -32,6 +34,18 @@ bool Server::start() {
     std::cout << "================================\n" << std::endl;
 
     m_logger.info("Server starting.");
+
+    // Step 0: Initialize SQLite message store
+    std::string dbErr;
+    if (!m_messageStore.init(dbErr)) {
+        m_logger.error("Failed to initialize message store: " + dbErr);
+        cleanup();
+        return false;
+    }
+    m_messageSequence.store(m_messageStore.getLastId());
+    m_roomManager.initNextInstanceId(m_messageStore.getLastRoomInstanceId() + 1);
+    m_logger.info("Message store initialized (last_id: " + std::to_string(m_messageStore.getLastId()) +
+                  ", last_room_instance: " + std::to_string(m_messageStore.getLastRoomInstanceId()) + ").");
 
     // Step 1: Create socket and configure address structure
     if (!initializeSocket()) {
@@ -221,7 +235,8 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                                                      reqMsg.type == protocol::TYPE_ROOM_LEAVE_REQ ||
                                                      reqMsg.type == protocol::TYPE_ROOM_LIST_REQ ||
                                                      reqMsg.type == protocol::TYPE_ROOM_MEMBERS_REQ ||
-                                                     reqMsg.type == protocol::TYPE_ROOM_MSG_REQ);
+                                                     reqMsg.type == protocol::TYPE_ROOM_MSG_REQ ||
+                                                     reqMsg.type == protocol::TYPE_HISTORY_REQ);
                             std::string errCode = isOpRequiringReg ? std::string(protocol::ERR_NOT_REGISTERED)
                                                                    : std::string(protocol::ERR_UNKNOWN_TYPE);
                             std::string errDetail = isOpRequiringReg ? "Client must register before performing operations"
@@ -379,19 +394,14 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             continue;
                         }
 
-                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
                         int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
 
-                        // Prepare structured broadcast envelope
-                        auto structBroadcast = protocol::StructuredMessage::createMsgBroadcast(
-                            registeredUsername, msg.content, msgId, nowSec, msg.to, msg.room);
-
-                        // Enforce wire-size constraint: serialized JSON envelope must remain within MAX_MESSAGE_SIZE
-                        if (structBroadcast.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
-                            m_logger.warning("Message from " + registeredUsername + " rejected: serialized envelope exceeds MAX_MESSAGE_SIZE (" +
-                                             std::to_string(structBroadcast.serializeWire().size()) + " > " +
-                                             std::to_string(protocol::MAX_MESSAGE_SIZE) + ")");
+                        // Enforce wire-size constraint before commit
+                        auto previewBroadcast = protocol::StructuredMessage::createMsgBroadcast(
+                            registeredUsername, msg.content, "msg-preview", nowSec, msg.to, msg.room);
+                        if (previewBroadcast.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            m_logger.warning("Message from " + registeredUsername + " rejected: serialized envelope exceeds MAX_MESSAGE_SIZE");
                             auto errResp = protocol::StructuredMessage::createError(
                                 protocol::ERR_MESSAGE_TOO_LARGE,
                                 "Serialized message envelope exceeds MAX_MESSAGE_SIZE wire limit",
@@ -399,6 +409,21 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
                             continue;
                         }
+
+                        // Persist to SQLite BEFORE sending ACK or broadcasting
+                        std::string msgId;
+                        std::string storeErr;
+                        if (!m_messageStore.storePublicMessage(registeredUsername, msg.content, nowSec, msgId, storeErr)) {
+                            m_logger.error("Failed to persist public message from " + registeredUsername + ": " + storeErr);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_STORAGE_ERROR, "Failed to persist message", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Prepare structured broadcast envelope with durable msgId
+                        auto structBroadcast = protocol::StructuredMessage::createMsgBroadcast(
+                            registeredUsername, msg.content, msgId, nowSec, msg.to, msg.room);
 
                         // Send msg_ack to sender
                         auto ack = protocol::StructuredMessage::createMsgAck(msgId, msg.id);
@@ -501,21 +526,34 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             continue;
                         }
 
-                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
                         int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
 
-                        auto directMsg = protocol::StructuredMessage::createMsgDirect(
-                            registeredUsername, recipientInfo.username, msg.content, msgId, nowSec);
-
-                        if (directMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                        // Enforce wire-size constraint before commit
+                        auto previewMsg = protocol::StructuredMessage::createMsgDirect(
+                            registeredUsername, recipientInfo.username, msg.content, "msg-preview", nowSec);
+                        if (previewMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
                             m_logger.warning("Direct message from " + registeredUsername + " to " + recipientInfo.username +
-                                             " rejected: exceeds wire limit (" + std::to_string(directMsg.serializeWire().size()) + " bytes)");
+                                             " rejected: exceeds wire limit (" + std::to_string(previewMsg.serializeWire().size()) + " bytes)");
                             auto errResp = protocol::StructuredMessage::createError(
                                 protocol::ERR_MESSAGE_TOO_LARGE, "Direct message envelope exceeds wire limit", msg.id);
                             ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
                             continue;
                         }
+
+                        // Persist to SQLite BEFORE delivering to recipient socket or returning ACK
+                        std::string msgId;
+                        std::string storeErr;
+                        if (!m_messageStore.storeDirectMessage(registeredUsername, recipientInfo.username, msg.content, nowSec, msgId, storeErr)) {
+                            m_logger.error("Failed to persist direct message from " + registeredUsername + " to " + recipientInfo.username + ": " + storeErr);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_STORAGE_ERROR, "Failed to persist direct message", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        auto directMsg = protocol::StructuredMessage::createMsgDirect(
+                            registeredUsername, recipientInfo.username, msg.content, msgId, nowSec);
 
                         // Deliver directly to recipient (outside global manager lock, serialized on recipient sendMutex)
                         bool delivered = false;
@@ -534,17 +572,14 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
 
                         if (!delivered) {
                             m_clientManager.removeClient(recipientInfo.socket);
-                            auto errResp = protocol::StructuredMessage::createError(
-                                protocol::ERR_RECIPIENT_NOT_FOUND, "Recipient is no longer available", msg.id);
-                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
-                            continue;
+                            // Message was successfully committed to database; delivery failure to socket does not erase it
                         }
 
                         // Send msg_direct_ack to sender
                         auto ack = protocol::StructuredMessage::createMsgDirectAck(msgId, recipientInfo.username, nowSec, msg.id);
                         ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger);
 
-                        m_logger.info("Direct message delivered from " + registeredUsername + " to " + recipientInfo.username + " (msg_id: " + msgId + ")");
+                        m_logger.info("Direct message committed and ACKed from " + registeredUsername + " to " + recipientInfo.username + " (msg_id: " + msgId + ")");
                     }
                     else if (msg.type == protocol::TYPE_ROOM_CREATE_REQ) {
                         std::string valErr;
@@ -672,28 +707,42 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
 
                         std::vector<RoomMember> peerTargets;
                         std::string canonRoom;
+                        int64_t roomInstanceId = 0;
                         std::string errCode, errMsg;
-                        if (!m_roomManager.getRoomPeers(msg.room, clientSocket, peerTargets, canonRoom, errCode, errMsg)) {
+                        if (!m_roomManager.getRoomPeers(msg.room, clientSocket, peerTargets, canonRoom, roomInstanceId, errCode, errMsg)) {
                             auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
                             ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
                             continue;
                         }
 
-                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
                         int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
 
-                        auto roomMsg = protocol::StructuredMessage::createRoomMsg(
-                            registeredUsername, canonRoom, msg.content, msgId, nowSec);
-
-                        if (roomMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                        // Enforce wire-size constraint before commit
+                        auto previewMsg = protocol::StructuredMessage::createRoomMsg(
+                            registeredUsername, canonRoom, msg.content, "msg-preview", nowSec);
+                        if (previewMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
                             m_logger.warning("Room message from " + registeredUsername + " to " + canonRoom + " exceeds wire limit (" +
-                                             std::to_string(roomMsg.serializeWire().size()) + " > " + std::to_string(protocol::MAX_MESSAGE_SIZE) + ")");
+                                             std::to_string(previewMsg.serializeWire().size()) + " > " + std::to_string(protocol::MAX_MESSAGE_SIZE) + ")");
                             auto errResp = protocol::StructuredMessage::createError(
                                 protocol::ERR_MESSAGE_TOO_LARGE, "Room message envelope exceeds wire limit", msg.id);
                             ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
                             continue;
                         }
+
+                        // Persist to SQLite BEFORE sending ACK or broadcasting
+                        std::string msgId;
+                        std::string storeErr;
+                        if (!m_messageStore.storeRoomMessage(registeredUsername, canonRoom, roomInstanceId, msg.content, nowSec, msgId, storeErr)) {
+                            m_logger.error("Failed to persist room message from " + registeredUsername + " to " + canonRoom + ": " + storeErr);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_STORAGE_ERROR, "Failed to persist room message", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        auto roomMsg = protocol::StructuredMessage::createRoomMsg(
+                            registeredUsername, canonRoom, msg.content, msgId, nowSec);
 
                         // Send room_msg_ack to sender
                         auto ack = protocol::StructuredMessage::createRoomMsgAck(msgId, canonRoom, nowSec, msg.id);
@@ -799,6 +848,124 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
 
                         ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
                     }
+                    else if (msg.type == protocol::TYPE_HISTORY_REQ) {
+                        std::string valErr;
+                        if (!msg.validate(valErr)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, valErr, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        int limit = (msg.limit > 0) ? msg.limit : protocol::DEFAULT_HISTORY_LIMIT;
+                        if (limit > protocol::MAX_HISTORY_LIMIT) {
+                            limit = protocol::MAX_HISTORY_LIMIT;
+                        }
+
+                        std::vector<protocol::HistoryItem> retrievedItems;
+                        bool hasMore = false;
+                        std::string storeErr;
+                        std::string respCanonRoom = msg.room;
+
+                        if (msg.conversationType == protocol::CONV_PUBLIC) {
+                            if (!m_messageStore.getPublicHistory(limit, msg.beforeId, msg.afterId, retrievedItems, hasMore, storeErr)) {
+                                m_logger.error("Failed to query public history for " + registeredUsername + ": " + storeErr);
+                                auto errResp = protocol::StructuredMessage::createError(
+                                    protocol::ERR_STORAGE_ERROR, "Storage failure while retrieving history", msg.id);
+                                ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                                continue;
+                            }
+                        }
+                        else if (msg.conversationType == protocol::CONV_DIRECT) {
+                            if (protocol::equalsIgnoreCase(registeredUsername, msg.withUser)) {
+                                auto errResp = protocol::StructuredMessage::createError(
+                                    protocol::ERR_CANNOT_MESSAGE_SELF, "Cannot query conversation history with yourself", msg.id);
+                                ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                                continue;
+                            }
+
+                            if (!m_messageStore.getDirectHistory(registeredUsername, msg.withUser, limit, msg.beforeId, msg.afterId, retrievedItems, hasMore, storeErr)) {
+                                m_logger.error("Failed to query direct history between " + registeredUsername + " and " + msg.withUser + ": " + storeErr);
+                                auto errResp = protocol::StructuredMessage::createError(
+                                    protocol::ERR_STORAGE_ERROR, "Storage failure while retrieving history", msg.id);
+                                ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                                continue;
+                            }
+                        }
+                        else if (msg.conversationType == protocol::CONV_ROOM) {
+                            int64_t roomInstanceId = 0;
+                            std::string errCode, errMsg;
+                            if (!m_roomManager.getRoomInstanceId(msg.room, clientSocket, roomInstanceId, respCanonRoom, errCode, errMsg)) {
+                                auto errResp = protocol::StructuredMessage::createError(errCode, errMsg, msg.id);
+                                ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                                continue;
+                            }
+
+                            if (!m_messageStore.getRoomHistory(roomInstanceId, limit, msg.beforeId, msg.afterId, retrievedItems, hasMore, storeErr)) {
+                                m_logger.error("Failed to query room history for " + respCanonRoom + ": " + storeErr);
+                                auto errResp = protocol::StructuredMessage::createError(
+                                    protocol::ERR_STORAGE_ERROR, "Storage failure while retrieving history", msg.id);
+                                ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                                continue;
+                            }
+                        }
+                        else {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_INVALID_CONVERSATION, "Invalid conversation type: " + msg.conversationType, msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Pack messages into history_resp enforcing the strict 2048-byte MAX_MESSAGE_SIZE wire limit
+                        auto resp = protocol::StructuredMessage::createHistoryResp(
+                            msg.conversationType, msg.withUser, respCanonRoom, {}, hasMore, msg.id);
+
+                        std::vector<protocol::HistoryItem> packed;
+                        if (!msg.afterId.empty()) {
+                            // Forward pagination: pack from oldest to newest (closest to after_id)
+                            for (size_t i = 0; i < retrievedItems.size(); ++i) {
+                                packed.push_back(retrievedItems[i]);
+                                resp.historyItems = packed;
+                                resp.count = static_cast<int>(packed.size());
+                                if (resp.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                                    packed.pop_back();
+                                    resp.historyItems = packed;
+                                    resp.count = static_cast<int>(packed.size());
+                                    resp.hasMore = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Default latest or backward pagination: pack from newest to oldest (closest to latest/cursor)
+                            for (int i = static_cast<int>(retrievedItems.size()) - 1; i >= 0; --i) {
+                                packed.push_back(retrievedItems[i]);
+                                resp.historyItems = packed;
+                                resp.count = static_cast<int>(packed.size());
+                                if (resp.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                                    packed.pop_back();
+                                    resp.historyItems = packed;
+                                    resp.count = static_cast<int>(packed.size());
+                                    resp.hasMore = true;
+                                    break;
+                                }
+                            }
+                            // Restore chronological ASC order
+                            std::reverse(packed.begin(), packed.end());
+                            resp.historyItems = packed;
+                            resp.count = static_cast<int>(packed.size());
+                        }
+
+                        if (packed.empty() && !retrievedItems.empty()) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE,
+                                "Historical message exceeds 2048-byte wire framing limit for history response",
+                                msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        ClientManager::sendAll(clientSocket, resp.serializeWire(), registeredUsername, &m_logger);
+                    }
                     else {
                         m_logger.warning("Unknown message type '" + msg.type + "' from " + registeredUsername);
                         auto errResp = protocol::StructuredMessage::createError(
@@ -820,9 +987,15 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                         continue;
                     }
 
-                    std::string msgId = "msg-" + std::to_string(++m_messageSequence);
                     int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
+
+                    std::string msgId;
+                    std::string storeErr;
+                    if (!m_messageStore.storePublicMessage(registeredUsername, line, nowSec, msgId, storeErr)) {
+                        m_logger.error("Failed to persist legacy message from " + registeredUsername + ": " + storeErr);
+                        continue;
+                    }
 
                     // Log received normal chat message as a CHAT event
                     m_logger.chat("[" + registeredUsername + "]: " + line);
@@ -1025,6 +1198,9 @@ void Server::stop() {
     if (m_netInitialized.exchange(false)) {
         netCleanup();
     }
+
+    // 5. Close message store
+    m_messageStore.close();
 
     m_logger.info("Server stopped.");
 }

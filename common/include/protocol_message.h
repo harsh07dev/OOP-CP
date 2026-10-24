@@ -16,6 +16,16 @@
 
 namespace protocol {
 
+struct HistoryItem {
+    std::string msgId;
+    std::string type;       // "public", "direct", "room"
+    std::string from;
+    std::string to;
+    std::string room;
+    std::string content;
+    int64_t timestamp{0};
+};
+
 struct StructuredMessage {
     int version{CURRENT_VERSION};
     std::string type;
@@ -42,6 +52,14 @@ struct StructuredMessage {
     int totalPages{0};       // Total pages calculated
     int64_t timestamp{0};    // UTC timestamp seconds since epoch
 
+    // History protocol fields
+    std::string conversationType;          // "public", "direct", "room"
+    std::string withUser;                  // Peer username for direct conversation history
+    std::string beforeId;                  // Message ID cursor for history pagination (older messages)
+    std::string afterId;                   // Message ID cursor for history pagination (newer messages)
+    bool hasMore{false};                   // Indicates more history messages available
+    std::vector<HistoryItem> historyItems; // Retrieved history items for history_resp
+
     // Serialize to compact single-line JSON string without delimiter
     std::string serialize() const {
         json::JsonValue obj = json::JsonValue::object();
@@ -67,6 +85,11 @@ struct StructuredMessage {
         if (totalUsers > 0) obj.set("total_users", json::JsonValue(totalUsers));
         if (totalRooms > 0) obj.set("total_rooms", json::JsonValue(totalRooms));
         if (totalMembers > 0) obj.set("total_members", json::JsonValue(totalMembers));
+
+        if (!conversationType.empty()) obj.set("conversation_type", json::JsonValue(conversationType));
+        if (!withUser.empty()) obj.set("with", json::JsonValue(withUser));
+        if (!beforeId.empty()) obj.set("before_id", json::JsonValue(beforeId));
+        if (!afterId.empty()) obj.set("after_id", json::JsonValue(afterId));
 
         if (!users.empty() || type == TYPE_USER_LIST_RESP) {
             json::JsonValue arr = json::JsonValue::array();
@@ -95,6 +118,26 @@ struct StructuredMessage {
             }
             obj.set("members", arr);
             int64_t c = (count > 0) ? count : static_cast<int64_t>(members.size());
+            obj.set("count", json::JsonValue(c));
+        }
+
+        if (type == TYPE_HISTORY_RESP || !historyItems.empty()) {
+            obj.set("has_more", json::JsonValue(hasMore));
+            json::JsonValue arr = json::JsonValue::array();
+            for (const auto& item : historyItems) {
+                json::JsonValue m = json::JsonValue::object();
+                m.set("id", json::JsonValue(item.msgId));
+                m.set("msg_id", json::JsonValue(item.msgId));
+                m.set("type", json::JsonValue(item.type));
+                m.set("from", json::JsonValue(item.from));
+                if (!item.to.empty()) m.set("to", json::JsonValue(item.to));
+                if (!item.room.empty()) m.set("room", json::JsonValue(item.room));
+                m.set("content", json::JsonValue(item.content));
+                m.set("timestamp", json::JsonValue(item.timestamp));
+                arr.arrVal.push_back(std::move(m));
+            }
+            obj.set("messages", arr);
+            int64_t c = (count > 0) ? count : static_cast<int64_t>(historyItems.size());
             obj.set("count", json::JsonValue(c));
         }
 
@@ -168,7 +211,10 @@ struct StructuredMessage {
             line.find("room_leave") != std::string_view::npos ||
             line.find("room_list") != std::string_view::npos ||
             line.find("room_members") != std::string_view::npos ||
-            line.find("room_msg") != std::string_view::npos) {
+            line.find("room_msg") != std::string_view::npos ||
+            line.find("history_req") != std::string_view::npos ||
+            line.find("history_resp") != std::string_view::npos ||
+            line.find("conversation_type") != std::string_view::npos) {
             return true;
         }
         return false;
@@ -226,6 +272,12 @@ struct StructuredMessage {
         outMsg.totalMembers = static_cast<int>(root.getInt("total_members", 0));
         outMsg.count = static_cast<int>(root.getInt("count", 0));
 
+        outMsg.conversationType = root.getString("conversation_type");
+        outMsg.withUser = root.getString("with");
+        outMsg.beforeId = root.getString("before_id");
+        outMsg.afterId = root.getString("after_id");
+        outMsg.hasMore = root.getBool("has_more", false);
+
         const auto& usersVal = root.get("users");
         if (usersVal.isArray()) {
             for (const auto& item : usersVal.arrVal) {
@@ -260,6 +312,29 @@ struct StructuredMessage {
         }
         if (outMsg.count == 0 && !outMsg.members.empty()) {
             outMsg.count = static_cast<int>(outMsg.members.size());
+        }
+
+        const auto& histVal = root.get("messages");
+        if (histVal.isArray()) {
+            for (const auto& item : histVal.arrVal) {
+                if (item.isObject()) {
+                    HistoryItem hi;
+                    hi.msgId = item.getString("id");
+                    if (hi.msgId.empty()) {
+                        hi.msgId = item.getString("msg_id");
+                    }
+                    hi.type = item.getString("type");
+                    hi.from = item.getString("from");
+                    hi.to = item.getString("to");
+                    hi.room = item.getString("room");
+                    hi.content = item.getString("content");
+                    hi.timestamp = item.getInt("timestamp", 0);
+                    outMsg.historyItems.push_back(std::move(hi));
+                }
+            }
+        }
+        if (outMsg.count == 0 && !outMsg.historyItems.empty()) {
+            outMsg.count = static_cast<int>(outMsg.historyItems.size());
         }
 
         return true;
@@ -379,6 +454,34 @@ struct StructuredMessage {
             }
             if (limit < 0) {
                 outErr = "Limit cannot be negative";
+                return false;
+            }
+        } else if (type == TYPE_HISTORY_REQ) {
+            if (conversationType.empty()) {
+                outErr = "History request requires 'conversation_type'";
+                return false;
+            }
+            if (conversationType != CONV_PUBLIC &&
+                conversationType != CONV_DIRECT &&
+                conversationType != CONV_ROOM) {
+                outErr = "Invalid 'conversation_type': must be 'public', 'direct', or 'room'";
+                return false;
+            }
+            if (conversationType == CONV_DIRECT && withUser.empty()) {
+                outErr = "Direct history request requires 'with' participant";
+                return false;
+            }
+            if (conversationType == CONV_ROOM && room.empty()) {
+                outErr = "Room history request requires 'room' name";
+                return false;
+            }
+            if (limit < 0) {
+                outErr = "Limit cannot be negative";
+                return false;
+            }
+        } else if (type == TYPE_HISTORY_RESP) {
+            if (status.empty()) {
+                outErr = "History response requires 'status'";
                 return false;
             }
         } else if (type == TYPE_SYSTEM_EVENT) {
@@ -714,6 +817,44 @@ struct StructuredMessage {
         m.event = std::string(EVENT_LEAVE);
         m.timestamp = timestamp;
         m.id = std::string(id);
+        return m;
+    }
+
+    static StructuredMessage createHistoryReq(std::string_view conversationType,
+                                             std::string_view withUser = "",
+                                             std::string_view room = "",
+                                             int limit = DEFAULT_HISTORY_LIMIT,
+                                             std::string_view beforeId = "",
+                                             std::string_view afterId = "",
+                                             std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_HISTORY_REQ);
+        m.id = std::string(id);
+        m.conversationType = std::string(conversationType);
+        m.withUser = std::string(withUser);
+        m.room = std::string(room);
+        m.limit = limit;
+        m.beforeId = std::string(beforeId);
+        m.afterId = std::string(afterId);
+        return m;
+    }
+
+    static StructuredMessage createHistoryResp(std::string_view conversationType,
+                                              std::string_view withUser,
+                                              std::string_view room,
+                                              const std::vector<HistoryItem>& items,
+                                              bool hasMore,
+                                              std::string_view id = "") {
+        StructuredMessage m;
+        m.type = std::string(TYPE_HISTORY_RESP);
+        m.id = std::string(id);
+        m.status = std::string(STATUS_OK);
+        m.conversationType = std::string(conversationType);
+        m.withUser = std::string(withUser);
+        m.room = std::string(room);
+        m.historyItems = items;
+        m.count = static_cast<int>(items.size());
+        m.hasMore = hasMore;
         return m;
     }
 

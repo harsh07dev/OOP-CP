@@ -1,7 +1,7 @@
-# Protocol Specification & Compatibility Audit (Phase 4 — Task 3)
+# Protocol Specification & Compatibility Audit (Phase 4 — Task 4)
 
 **Document:** `docs/PROTOCOL_SPECIFICATION.md`  
-**Status:** Implemented and Tested (43/43 Regression Scenarios Passing)  
+**Status:** Implemented and Tested (55/55 Regression Scenarios Passing)  
 **Applicability:** C++17 Multi-Client TCP Chat Architecture  
 
 ---
@@ -382,6 +382,97 @@ Response:
 
 ---
 
+### 4.14 Persistent Message History
+
+SQLite-backed persistent message history supports durable storage and authorized, paginated, cursor-based retrieval of public chat, direct messages, and room conversations.
+
+#### 1. Storage Architecture & Schema:
+Storage is implemented via the thread-safe `MessageStore` component using a local SQLite database (`chat_history.db` by default, or configured via CLI argument `chat_server [port] [db_path]`).
+- **Schema**:
+  ```sql
+  CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY,
+      msg_id TEXT UNIQUE NOT NULL,
+      conv_type TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      recipient TEXT,
+      direct_pair TEXT,
+      room_name TEXT,
+      room_instance_id INTEGER,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_public ON messages(conv_type, id ASC);
+  CREATE INDEX IF NOT EXISTS idx_messages_direct ON messages(conv_type, direct_pair, id ASC);
+  CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(conv_type, room_instance_id, id ASC);
+  ```
+- **Monotonic Sequence Resumption**: Upon startup, `MessageStore` initializes its sequence counter from `SELECT COALESCE(MAX(id), 0) FROM messages`, ensuring `msg-<id>` values resume without collision across restarts.
+- **Direct Message Pair Normalization**: Usernames are canonicalized into sorted lowercase pairs (`"alice:bob"`) stored in `direct_pair`, allowing indexed $O(\log N)$ bi-directional lookups.
+- **Room Instance Isolation**: Each room creation generates a distinct `room_instance_id` (resumed from `MAX(room_instance_id)`). When an ephemeral room is deleted and later re-created with the same name, historical messages remain associated with the original `room_instance_id`, preventing historical leakage to the new room incarnation.
+- **Commit-Before-ACK Semantics**: A success acknowledgement (`msg_ack`, `msg_direct_ack`, `room_msg_ack`) and broadcast are only issued after a successful SQLite transaction commit. Storage failures immediately abort the broadcast and return `ERR_STORAGE_ERROR`.
+- **Disconnect Resilience**: Once committed to SQLite, subsequent socket delivery failures do not delete or roll back the message.
+
+#### 2. Authorization Rules:
+1. **Public History**: Accessible to any registered client.
+2. **Direct History**: Accessible only to the two participants (`user == sender || user == recipient`). Third parties cannot retrieve or enumerate messages from other conversations. Attempting to query history with oneself is rejected with `ERR_CANNOT_MESSAGE_SELF`.
+3. **Room History**: Accessible only to active members currently joined to that room instance (`ERR_NOT_IN_ROOM` if not in the room or after leaving).
+
+#### 3. Pagination & Wire Framing Bounding:
+- **Parameters**: `limit` (default 20, maximum 50).
+- **Cursor Mechanism**:
+  - `before_id`: Returns messages strictly older than the cursor ID (backward pagination).
+  - `after_id`: Returns messages strictly newer than the cursor ID (forward pagination).
+  - No cursor: Returns the most recent page of messages up to `limit`.
+- **Wire Bounding Invariant**: Complete `HistoryItem` records are packed dynamically into `history_resp` until the 2048-byte `MAX_MESSAGE_SIZE` frame limit is approached. When packing would exceed 2048 bytes, the server halts packing, sets `has_more: true`, and transmits the valid JSON frame without truncation.
+
+#### History Request (`history_req`)
+```json
+{"version": 1, "type": "history_req", "id": "req-h-1", "conversation_type": "direct", "with": "Bob", "limit": 20, "before_id": "msg-45"}
+```
+Fields:
+- `conversation_type` (required): `"public"`, `"direct"`, or `"room"`.
+- `with` (required for direct): Participant username.
+- `room` (required for room): Room name.
+- `limit` (optional): Items per page (default 20, max 50).
+- `before_id` (optional): Cursor for backward pagination.
+- `after_id` (optional): Cursor for forward pagination.
+
+#### History Response (`history_resp`)
+```json
+{
+  "version": 1,
+  "type": "history_resp",
+  "id": "req-h-1",
+  "status": "ok",
+  "conversation_type": "direct",
+  "with": "Bob",
+  "count": 2,
+  "has_more": false,
+  "messages": [
+    {
+      "id": "msg-40",
+      "msg_id": "msg-40",
+      "type": "direct",
+      "from": "Alice",
+      "to": "Bob",
+      "content": "Hello Bob!",
+      "timestamp": 1729800030
+    },
+    {
+      "id": "msg-41",
+      "msg_id": "msg-41",
+      "type": "direct",
+      "from": "Bob",
+      "to": "Alice",
+      "content": "Hi Alice!",
+      "timestamp": 1729800035
+    }
+  ]
+}
+```
+
+---
+
 ## 5. Standard Error Codes
 
 | Error Code | Trigger Condition | Worker Thread Action |
@@ -389,7 +480,7 @@ Response:
 | `ERR_MALFORMED_MESSAGE` | Non-JSON text from structured client, syntax error, or unclosed string | Sends error; continues or terminates based on severity |
 | `ERR_UNSUPPORTED_VERSION` | `"version"` is not equal to `1` | Sends error; safely closes connection |
 | `ERR_UNKNOWN_TYPE` | Unrecognized `"type"` identifier | Sends error; discards unknown message |
-| `ERR_NOT_REGISTERED` | Client sent room/DM/list request before registering | Sends error; closes connection |
+| `ERR_NOT_REGISTERED` | Client sent room/DM/list/history request before registering | Sends error; closes connection |
 | `ERR_INVALID_PAGE` | Page number in query is negative | Sends error; ignores request |
 | `ERR_INVALID_USERNAME` | Username fails character or length validation rules | Sends error; closes connection |
 | `ERR_USERNAME_TAKEN` | Username matches existing client case-insensitively | Sends error; closes connection |
@@ -400,8 +491,11 @@ Response:
 | `ERR_INVALID_ROOM_NAME` | Room name empty, > 32 characters, or contains invalid characters | Sends error with correlation ID |
 | `ERR_ROOM_ALREADY_EXISTS` | Room name already exists (case-insensitive) | Sends error with correlation ID |
 | `ERR_ROOM_NOT_FOUND` | Room name does not exist | Sends error with correlation ID |
-| `ERR_NOT_IN_ROOM` | Client attempts to send message or list members of a room they have not joined | Sends error with correlation ID |
+| `ERR_NOT_IN_ROOM` | Client attempts to send message, query history, or list members of a room they have not joined | Sends error with correlation ID |
 | `ERR_ALREADY_IN_ROOM` | Client attempts to join a room they are already in | Sends error with correlation ID |
+| `ERR_STORAGE_ERROR` | SQLite database execution, connection, or commit error | Sends error with correlation ID; prevents false ACK/broadcast |
+| `ERR_UNAUTHORIZED` | Client lacks authorization to access requested resource | Sends error with correlation ID |
+| `ERR_INVALID_CONVERSATION` | Invalid conversation type or missing required conversation target | Sends error with correlation ID |
 
 ---
 
@@ -414,24 +508,27 @@ Response:
 2. **[common/include/protocol.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol.h)**:
    - Centralizes version constants, message types, status tokens, pagination limits, room limits, and validation helpers.
 3. **[common/include/protocol_message.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/common/include/protocol_message.h)**:
-   - High-level `StructuredMessage` representation, serialization/deserialization, semantic validation, pagination helpers, and factory helpers for all private and room message contracts.
-4. **[server/include/client_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/client_manager.h) & [server/src/client_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/client_manager.cpp)**:
+   - High-level `StructuredMessage` representation, serialization/deserialization, semantic validation, pagination helpers, and factory helpers for all private, room, and history message contracts.
+4. **[server/include/message_store.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/message_store.h) & [server/src/message_store.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/message_store.cpp)**:
+   - Thread-safe persistence component managing an embedded SQLite database.
+   - Automatic schema initialization, WAL journaling, prepared statement caching, and monotonic ID resumption.
+   - Lock isolation: database I/O is performed strictly under `MessageStore::m_mutex`, completely decoupling database locks from `ClientManager` or `RoomManager` mutexes.
+5. **[server/include/client_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/client_manager.h) & [server/src/client_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/client_manager.cpp)**:
    - Tracks client protocol version and metadata in `ClientInfo`.
    - Thread-safe `getClientByUsername()` performs case-insensitive recipient resolution.
    - Snapshot-under-mutex design: socket transmission occurs strictly after releasing manager mutexes.
-5. **[server/include/room_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/room_manager.h) & [server/src/room_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/room_manager.cpp)**:
+6. **[server/include/room_manager.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/include/room_manager.h) & [server/src/room_manager.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/room_manager.cpp)**:
    - Thread-safe `RoomManager` manages room lifecycles and memberships under `m_mutex`.
+   - Tracks unique monotonically increasing `instanceId` per room incarnation to guarantee historical message isolation upon room name re-use.
    - Independent mutex hierarchy: `RoomManager` never acquires `ClientManager` locks and vice versa.
-   - Snapshot methods return recipient lists without holding mutexes during network I/O.
-   - Automatic cleanup: automatically deletes rooms when the last member departs.
-6. **[server/src/server.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp)**:
-   - Handshake detection, registration enforcement, monotonic message sequencing, private routing, room operations, and clean disconnect teardown.
+7. **[server/src/server.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp)**:
+   - Handshake detection, registration enforcement, monotonic message sequencing, private routing, room operations, history pagination, and clean disconnect teardown.
 
 ---
 
-## 7. Test Results (43/43 Passing)
+## 7. Test Results (55/55 Passing)
 
-The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes legacy tests and Phase 4 structured tests:
+The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes legacy tests, online users list tests, private messaging and room tests, and SQLite persistence history tests:
 
 | Test ID | Test Name | Protocol Tested | Status |
 |---|---|---|---|
@@ -478,3 +575,15 @@ The complete regression suite in [tests/regression_tests.py](file:///c:/Users/ha
 | 41 | Chat room wire limit bounding | Structured v1 | **Passed** |
 | 42 | Concurrent room operations, private messaging, and thread safety | Structured v1 | **Passed** |
 | 43 | Cross-protocol isolation (legacy client compatibility) | Dual-mode | **Passed** |
+| 44 | Public history retrieval, ordering, and empty history | Structured v1 | **Passed** |
+| 45 | Direct message persistence, bi-directional retrieval, and third-party isolation | Structured v1 | **Passed** |
+| 46 | Room message persistence, membership authorization, and non-member isolation | Structured v1 | **Passed** |
+| 47 | Persistence across server restart and durable message ID uniqueness | Structured v1 | **Passed** |
+| 48 | Cursor-based pagination (before_id and after_id) | Structured v1 | **Passed** |
+| 49 | Parameter validation and authorization bounds | Structured v1 | **Passed** |
+| 50 | Escaped characters and Unicode round-tripping | Structured v1 | **Passed** |
+| 51 | Oversized history wire limit bounding | Structured v1 | **Passed** |
+| 52 | Room name reuse historical isolation | Structured v1 | **Passed** |
+| 53 | Storage failure handling and zero false ACK/broadcast | Structured v1 | **Passed** |
+| 54 | Concurrent public, direct, and room message storage integrity | Structured v1 | **Passed** |
+| 55 | Disconnect resilience (delivery failure after DB commit does not erase message) | Structured v1 | **Passed** |

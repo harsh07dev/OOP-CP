@@ -100,9 +100,24 @@ class BufferedSocket:
                 return line
         return ""
 
-def start_server():
+TEST_DB = os.path.abspath(f"test_regression_{os.getpid()}.db")
+
+def cleanup_db(path):
+    for f in [path, path + "-wal", path + "-shm"]:
+        if os.path.isfile(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+def start_server(port=8080, db_path=None, env=None):
     global SERVER_EXE
-    p = subprocess.Popen([SERVER_EXE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    target_db = db_path if db_path is not None else TEST_DB
+    cmd = [SERVER_EXE, str(port), target_db]
+    server_env = os.environ.copy()
+    if env:
+        server_env.update(env)
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=server_env)
     time.sleep(0.8)
     return p
 
@@ -137,12 +152,13 @@ def run_all_tests():
         print("Using direct compiler build with strong warnings as errors...")
         server_cmd = [
             "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Icommon/include", "-Iserver/include",
-            "server/src/main.cpp", "server/src/server.cpp", "server/src/client_manager.cpp", "server/src/room_manager.cpp", "server/src/logger.cpp"
+            "server/src/main.cpp", "server/src/server.cpp", "server/src/client_manager.cpp", "server/src/room_manager.cpp",
+            "server/src/message_store.cpp", "server/src/logger.cpp"
         ]
         if sys.platform == "win32":
-            server_cmd += ["-lws2_32", "-o", "chat_server.exe"]
+            server_cmd += ["-lws2_32", "-lsqlite3", "-o", "chat_server.exe"]
         else:
-            server_cmd += ["-pthread", "-o", "chat_server"]
+            server_cmd += ["-pthread", "-lsqlite3", "-o", "chat_server"]
 
         client_cmd = [
             "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Icommon/include", "-Iclient/include",
@@ -2067,8 +2083,808 @@ def run_all_tests():
         except Exception as e:
             results["Test 43: Cross-protocol isolation (legacy client compatibility)"] = f"Failed ({e})"
             print("Test 43 FAILED with exception:", e)
+
+        # Test 44: Public history retrieval, ordering, empty history, and legacy client message persistence
+        print("\n--- Test 44: Public history retrieval, ordering, and empty history ---")
+        try:
+            t44_passed = True
+            t44_details = []
+
+            s_a44 = BufferedSocket()
+            s_a44.connect((HOST, PORT))
+            s_a44.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice44", "id": "reg-a44"}) + "\n").encode('utf-8'))
+            recv_matching(s_a44, ["register_ack"], timeout=2.0)
+
+            # Sub-test 44A: Empty public history when queried with before_id="msg-1"
+            s_a44.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-empty", "conversation_type": "public", "before_id": "msg-1"}) + "\n").encode('utf-8'))
+            empty_resp = recv_matching(s_a44, ["history_resp"], timeout=2.0)
+            if empty_resp and empty_resp.get("status") == "ok" and empty_resp.get("messages") == [] and empty_resp.get("has_more") is False:
+                t44_details.append("44A (empty history query returns empty array and has_more=false) OK")
+            else:
+                t44_passed = False
+                t44_details.append(f"44A failed: {empty_resp}")
+
+            # Sub-test 44B: Legacy public message + structured public messages stored and retrievable in chronological order
+            s_leg44 = BufferedSocket()
+            s_leg44.connect((HOST, PORT))
+            s_leg44.sendall(b"HistLeg44\n")
+            s_leg44.recv_line(timeout=2.0)
+
+            s_leg44.sendall(b"Legacy public msg 44\n")
+            time.sleep(0.05)
+
+            s_a44.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "pub-44-1", "content": "Structured public msg 44-1"}) + "\n").encode('utf-8'))
+            recv_matching(s_a44, ["msg_ack"], timeout=2.0)
+
+            s_a44.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "pub-44-2", "content": "Structured public msg 44-2"}) + "\n").encode('utf-8'))
+            recv_matching(s_a44, ["msg_ack"], timeout=2.0)
+
+            s_a44.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-pub-44", "conversation_type": "public", "limit": 20}) + "\n").encode('utf-8'))
+            pub_hist = recv_matching(s_a44, ["history_resp"], timeout=2.0)
+
+            if pub_hist and pub_hist.get("status") == "ok":
+                msgs = pub_hist.get("messages", [])
+                contents = [m.get("content") for m in msgs]
+                if ("Legacy public msg 44" in contents and
+                    "Structured public msg 44-1" in contents and
+                    "Structured public msg 44-2" in contents):
+                    idx_leg = contents.index("Legacy public msg 44")
+                    idx_s1 = contents.index("Structured public msg 44-1")
+                    idx_s2 = contents.index("Structured public msg 44-2")
+                    if idx_leg < idx_s1 < idx_s2:
+                        t44_details.append("44B (legacy and structured public messages retrievable in chronological order) OK")
+                    else:
+                        t44_passed = False
+                        t44_details.append(f"44B failed: order {idx_leg}, {idx_s1}, {idx_s2}")
+                else:
+                    t44_passed = False
+                    t44_details.append(f"44B failed: contents={contents}")
+            else:
+                t44_passed = False
+                t44_details.append(f"44B failed: {pub_hist}")
+
+            s_leg44.close()
+            s_a44.close()
+
+            if t44_passed:
+                results["Test 44: Public history retrieval, ordering, and empty history"] = "Passed"
+                print(f"Test 44 PASSED: {'; '.join(t44_details)}")
+            else:
+                results["Test 44: Public history retrieval, ordering, and empty history"] = f"Failed ({'; '.join(t44_details)})"
+                print(f"Test 44 FAILED: {'; '.join(t44_details)}")
+        except Exception as e:
+            results["Test 44: Public history retrieval, ordering, and empty history"] = f"Failed ({e})"
+            print("Test 44 FAILED with exception:", e)
+
+        # Test 45: Direct message persistence, bi-directional authorized retrieval, and third-party isolation
+        print("\n--- Test 45: Direct message persistence, bi-directional retrieval, and third-party isolation ---")
+        try:
+            t45_passed = True
+            t45_details = []
+
+            s_a45 = BufferedSocket()
+            s_a45.connect((HOST, PORT))
+            s_a45.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice45", "id": "reg-a45"}) + "\n").encode('utf-8'))
+            recv_matching(s_a45, ["register_ack"], timeout=2.0)
+
+            s_b45 = BufferedSocket()
+            s_b45.connect((HOST, PORT))
+            s_b45.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob45", "id": "reg-b45"}) + "\n").encode('utf-8'))
+            recv_matching(s_b45, ["register_ack"], timeout=2.0)
+
+            s_c45 = BufferedSocket()
+            s_c45.connect((HOST, PORT))
+            s_c45.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistCharlie45", "id": "reg-c45"}) + "\n").encode('utf-8'))
+            recv_matching(s_c45, ["register_ack"], timeout=2.0)
+
+            # Alice sends DM to Bob
+            s_a45.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-45-1", "to": "HistBob45", "content": "Secret A to B"}) + "\n").encode('utf-8'))
+            recv_matching(s_a45, ["msg_direct_ack"], timeout=2.0)
+            recv_matching(s_b45, ["msg_direct"], timeout=2.0)
+
+            # Bob sends DM to Alice
+            s_b45.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-45-2", "to": "HistAlice45", "content": "Secret B to A"}) + "\n").encode('utf-8'))
+            recv_matching(s_b45, ["msg_direct_ack"], timeout=2.0)
+            recv_matching(s_a45, ["msg_direct"], timeout=2.0)
+
+            # Alice retrieves direct history with Bob
+            s_a45.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-dm-a", "conversation_type": "direct", "with": "HistBob45"}) + "\n").encode('utf-8'))
+            a_hist = recv_matching(s_a45, ["history_resp"], timeout=2.0)
+            a_msgs = [m.get("content") for m in a_hist.get("messages", [])] if a_hist else []
+
+            # Bob retrieves direct history with Alice
+            s_b45.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-dm-b", "conversation_type": "direct", "with": "HistAlice45"}) + "\n").encode('utf-8'))
+            b_hist = recv_matching(s_b45, ["history_resp"], timeout=2.0)
+            b_msgs = [m.get("content") for m in b_hist.get("messages", [])] if b_hist else []
+
+            if (a_msgs == ["Secret A to B", "Secret B to A"] and
+                b_msgs == ["Secret A to B", "Secret B to A"]):
+                t45_details.append("45A (Alice and Bob bi-directional direct history identical and ordered) OK")
+            else:
+                t45_passed = False
+                t45_details.append(f"45A failed: a_msgs={a_msgs}, b_msgs={b_msgs}")
+
+            # Charlie (third party) attempts to query direct history with Alice
+            s_c45.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-dm-c1", "conversation_type": "direct", "with": "HistAlice45"}) + "\n").encode('utf-8'))
+            c1_hist = recv_matching(s_c45, ["history_resp"], timeout=2.0)
+            c1_msgs = c1_hist.get("messages", []) if c1_hist else None
+
+            # Charlie attempts to query direct history with Bob
+            s_c45.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-dm-c2", "conversation_type": "direct", "with": "HistBob45"}) + "\n").encode('utf-8'))
+            c2_hist = recv_matching(s_c45, ["history_resp"], timeout=2.0)
+            c2_msgs = c2_hist.get("messages", []) if c2_hist else None
+
+            if c1_msgs == [] and c2_msgs == []:
+                t45_details.append("45B (third-party Charlie receives 0 direct messages from Alice/Bob conversation) OK")
+            else:
+                t45_passed = False
+                t45_details.append(f"45B failed: c1={c1_msgs}, c2={c2_msgs}")
+
+            s_a45.close()
+            s_b45.close()
+            s_c45.close()
+
+            if t45_passed:
+                results["Test 45: Direct message persistence, bi-directional retrieval, and third-party isolation"] = "Passed"
+                print(f"Test 45 PASSED: {'; '.join(t45_details)}")
+            else:
+                results["Test 45: Direct message persistence, bi-directional retrieval, and third-party isolation"] = f"Failed ({'; '.join(t45_details)})"
+                print(f"Test 45 FAILED: {'; '.join(t45_details)}")
+        except Exception as e:
+            results["Test 45: Direct message persistence, bi-directional retrieval, and third-party isolation"] = f"Failed ({e})"
+            print("Test 45 FAILED with exception:", e)
+
+        # Test 46: Room message persistence, membership authorization, and non-member isolation
+        print("\n--- Test 46: Room message persistence, membership authorization, and non-member isolation ---")
+        try:
+            t46_passed = True
+            t46_details = []
+
+            s_a46 = BufferedSocket()
+            s_a46.connect((HOST, PORT))
+            s_a46.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice46", "id": "reg-a46"}) + "\n").encode('utf-8'))
+            recv_matching(s_a46, ["register_ack"], timeout=2.0)
+
+            s_b46 = BufferedSocket()
+            s_b46.connect((HOST, PORT))
+            s_b46.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob46", "id": "reg-b46"}) + "\n").encode('utf-8'))
+            recv_matching(s_b46, ["register_ack"], timeout=2.0)
+
+            s_c46 = BufferedSocket()
+            s_c46.connect((HOST, PORT))
+            s_c46.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistCharlie46", "id": "reg-c46"}) + "\n").encode('utf-8'))
+            recv_matching(s_c46, ["register_ack"], timeout=2.0)
+
+            # Alice creates room #room46
+            s_a46.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-46", "room": "#room46"}) + "\n").encode('utf-8'))
+            recv_matching(s_a46, ["room_create_resp"], timeout=2.0)
+
+            # Bob joins room #room46
+            s_b46.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-46", "room": "#room46"}) + "\n").encode('utf-8'))
+            recv_matching(s_b46, ["room_join_resp"], timeout=2.0)
+
+            # Alice and Bob send messages in #room46
+            s_a46.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "rm-46-1", "room": "#room46", "content": "Room confidential 1"}) + "\n").encode('utf-8'))
+            recv_matching(s_a46, ["room_msg_ack"], timeout=2.0)
+
+            s_b46.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "rm-46-2", "room": "#room46", "content": "Room confidential 2"}) + "\n").encode('utf-8'))
+            recv_matching(s_b46, ["room_msg_ack"], timeout=2.0)
+
+            # Bob requests room history
+            s_b46.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-rm-b", "conversation_type": "room", "room": "#room46"}) + "\n").encode('utf-8'))
+            rm_hist = recv_matching(s_b46, ["history_resp"], timeout=2.0)
+            rm_msgs = [m.get("content") for m in rm_hist.get("messages", [])] if rm_hist else []
+
+            if rm_msgs == ["Room confidential 1", "Room confidential 2"]:
+                t46_details.append("46A (authorized member retrieves persistent room messages in order) OK")
+            else:
+                t46_passed = False
+                t46_details.append(f"46A failed: rm_msgs={rm_msgs}")
+
+            # Charlie (non-member) requests room history -> ERR_NOT_IN_ROOM
+            s_c46.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-rm-c", "conversation_type": "room", "room": "#room46"}) + "\n").encode('utf-8'))
+            c_err = recv_matching(s_c46, ["error"], timeout=2.0)
+            if c_err and c_err.get("code") == "ERR_NOT_IN_ROOM":
+                t46_details.append("46B (non-member Charlie rejected with ERR_NOT_IN_ROOM) OK")
+            else:
+                t46_passed = False
+                t46_details.append(f"46B failed: {c_err}")
+
+            # Bob leaves the room
+            s_b46.sendall((json.dumps({"version": 1, "type": "room_leave_req", "id": "lv-46", "room": "#room46"}) + "\n").encode('utf-8'))
+            recv_matching(s_b46, ["room_leave_resp"], timeout=2.0)
+
+            # Bob now requests room history -> ERR_NOT_IN_ROOM
+            s_b46.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-rm-b2", "conversation_type": "room", "room": "#room46"}) + "\n").encode('utf-8'))
+            b_err = recv_matching(s_b46, ["error"], timeout=2.0)
+            if b_err and b_err.get("code") == "ERR_NOT_IN_ROOM":
+                t46_details.append("46C (former member Bob rejected with ERR_NOT_IN_ROOM after leaving) OK")
+            else:
+                t46_passed = False
+                t46_details.append(f"46C failed: {b_err}")
+
+            s_a46.close()
+            s_b46.close()
+            s_c46.close()
+
+            if t46_passed:
+                results["Test 46: Room message persistence, membership authorization, and non-member isolation"] = "Passed"
+                print(f"Test 46 PASSED: {'; '.join(t46_details)}")
+            else:
+                results["Test 46: Room message persistence, membership authorization, and non-member isolation"] = f"Failed ({'; '.join(t46_details)})"
+                print(f"Test 46 FAILED: {'; '.join(t46_details)}")
+        except Exception as e:
+            results["Test 46: Room message persistence, membership authorization, and non-member isolation"] = f"Failed ({e})"
+            print("Test 46 FAILED with exception:", e)
+
+        # Test 47: Persistence across server restart and durable message ID uniqueness
+        print("\n--- Test 47: Persistence across server restart and durable message ID uniqueness ---")
+        try:
+            t47_passed = True
+            t47_details = []
+
+            s_pre = BufferedSocket()
+            s_pre.connect((HOST, PORT))
+            s_pre.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistUser47", "id": "reg-47"}) + "\n").encode('utf-8'))
+            recv_matching(s_pre, ["register_ack"], timeout=2.0)
+
+            s_pre.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "m-pre", "content": "Survives Server Restart 47"}) + "\n").encode('utf-8'))
+            pre_ack = recv_matching(s_pre, ["msg_ack"], timeout=2.0)
+            pre_msg_id = pre_ack.get("msg_id", "")
+            id_pre_num = int(pre_msg_id.split("-")[1]) if "-" in pre_msg_id else 0
+
+            s_pre.close()
+            time.sleep(0.2)
+
+            # Stop server and restart pointing to the exact same TEST_DB
+            stop_server(srv_struct)
+            time.sleep(0.5)
+            srv_struct = start_server(port=PORT, db_path=TEST_DB)
+            time.sleep(0.5)
+
+            s_post = BufferedSocket()
+            s_post.connect((HOST, PORT))
+            s_post.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistUser47Post", "id": "reg-47post"}) + "\n").encode('utf-8'))
+            recv_matching(s_post, ["register_ack"], timeout=2.0)
+
+            # Query public history after restart
+            s_post.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-post", "conversation_type": "public", "limit": 20}) + "\n").encode('utf-8'))
+            post_hist = recv_matching(s_post, ["history_resp"], timeout=2.0)
+            post_contents = [m.get("content") for m in post_hist.get("messages", [])] if post_hist else []
+
+            if "Survives Server Restart 47" in post_contents:
+                t47_details.append("47A (messages persisted and retrievable across full server restart) OK")
+            else:
+                t47_passed = False
+                t47_details.append(f"47A failed: contents={post_contents}")
+
+            # Send new message and verify message ID continues monotonically
+            s_post.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "m-post", "content": "Post-restart message"}) + "\n").encode('utf-8'))
+            post_ack = recv_matching(s_post, ["msg_ack"], timeout=2.0)
+            post_msg_id = post_ack.get("msg_id", "")
+            id_post_num = int(post_msg_id.split("-")[1]) if "-" in post_msg_id else 0
+
+            if id_post_num > id_pre_num:
+                t47_details.append(f"47B (durable message ID monotonically resumed: {pre_msg_id} -> {post_msg_id}) OK")
+            else:
+                t47_passed = False
+                t47_details.append(f"47B failed: pre={pre_msg_id}, post={post_msg_id}")
+
+            s_post.close()
+
+            if t47_passed:
+                results["Test 47: Persistence across server restart and durable message ID uniqueness"] = "Passed"
+                print(f"Test 47 PASSED: {'; '.join(t47_details)}")
+            else:
+                results["Test 47: Persistence across server restart and durable message ID uniqueness"] = f"Failed ({'; '.join(t47_details)})"
+                print(f"Test 47 FAILED: {'; '.join(t47_details)}")
+        except Exception as e:
+            results["Test 47: Persistence across server restart and durable message ID uniqueness"] = f"Failed ({e})"
+            print("Test 47 FAILED with exception:", e)
+
+        # Test 48: Cursor-based pagination (before_id, after_id, zero duplicate/omission invariant)
+        print("\n--- Test 48: Cursor-based pagination ---")
+        try:
+            t48_passed = True
+            t48_details = []
+
+            s_a48 = BufferedSocket()
+            s_a48.connect((HOST, PORT))
+            s_a48.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice48", "id": "reg-a48"}) + "\n").encode('utf-8'))
+            recv_matching(s_a48, ["register_ack"], timeout=2.0)
+
+            s_b48 = BufferedSocket()
+            s_b48.connect((HOST, PORT))
+            s_b48.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob48", "id": "reg-b48"}) + "\n").encode('utf-8'))
+            recv_matching(s_b48, ["register_ack"], timeout=2.0)
+
+            sent_ids = []
+            sent_texts = [f"PageTest48 msg #{i}" for i in range(8)]
+            for text in sent_texts:
+                s_a48.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": f"dm48-{text}", "to": "HistBob48", "content": text}) + "\n").encode('utf-8'))
+                ack = recv_matching(s_a48, ["msg_direct_ack"], timeout=2.0)
+                recv_matching(s_b48, ["msg_direct"], timeout=2.0)
+                sent_ids.append(ack.get("msg_id"))
+
+            # Page 1 (latest 3 messages, limit=3)
+            s_a48.sendall((json.dumps({"version": 1, "type": "history_req", "id": "p-1", "conversation_type": "direct", "with": "HistBob48", "limit": 3}) + "\n").encode('utf-8'))
+            p1 = recv_matching(s_a48, ["history_resp"], timeout=2.0)
+            p1_msgs = p1.get("messages", [])
+            p1_contents = [m.get("content") for m in p1_msgs]
+
+            # Page 2 (older 3 messages, before_id = oldest ID of page 1)
+            cursor1 = p1_msgs[0].get("id")
+            s_a48.sendall((json.dumps({"version": 1, "type": "history_req", "id": "p-2", "conversation_type": "direct", "with": "HistBob48", "limit": 3, "before_id": cursor1}) + "\n").encode('utf-8'))
+            p2 = recv_matching(s_a48, ["history_resp"], timeout=2.0)
+            p2_msgs = p2.get("messages", [])
+            p2_contents = [m.get("content") for m in p2_msgs]
+
+            # Page 3 (remaining 2 messages, before_id = oldest ID of page 2)
+            cursor2 = p2_msgs[0].get("id")
+            s_a48.sendall((json.dumps({"version": 1, "type": "history_req", "id": "p-3", "conversation_type": "direct", "with": "HistBob48", "limit": 3, "before_id": cursor2}) + "\n").encode('utf-8'))
+            p3 = recv_matching(s_a48, ["history_resp"], timeout=2.0)
+            p3_msgs = p3.get("messages", [])
+            p3_contents = [m.get("content") for m in p3_msgs]
+
+            # Reconstruct chronological stream: page 3 + page 2 + page 1
+            reconstructed = p3_contents + p2_contents + p1_contents
+
+            if (p1.get("has_more") is True and p2.get("has_more") is True and p3.get("has_more") is False and
+                reconstructed == sent_texts):
+                t48_details.append("48A (backward cursor pagination via before_id reconstructed all 8 messages without duplicates or omissions) OK")
+            else:
+                t48_passed = False
+                t48_details.append(f"48A failed: p1_has_more={p1.get('has_more')}, p2_has_more={p2.get('has_more')}, p3_has_more={p3.get('has_more')}, reconstructed={reconstructed}")
+
+            # Forward cursor pagination via after_id
+            cursor_after = sent_ids[2] # After msg #2
+            s_a48.sendall((json.dumps({"version": 1, "type": "history_req", "id": "p-after", "conversation_type": "direct", "with": "HistBob48", "limit": 3, "after_id": cursor_after}) + "\n").encode('utf-8'))
+            p_after = recv_matching(s_a48, ["history_resp"], timeout=2.0)
+            after_contents = [m.get("content") for m in p_after.get("messages", [])]
+            if after_contents == sent_texts[3:6]:
+                t48_details.append("48B (forward cursor pagination via after_id returned exact slice) OK")
+            else:
+                t48_passed = False
+                t48_details.append(f"48B failed: after_contents={after_contents}, expected={sent_texts[3:6]}")
+
+            s_a48.close()
+            s_b48.close()
+
+            if t48_passed:
+                results["Test 48: Cursor-based pagination (before_id and after_id)"] = "Passed"
+                print(f"Test 48 PASSED: {'; '.join(t48_details)}")
+            else:
+                results["Test 48: Cursor-based pagination (before_id and after_id)"] = f"Failed ({'; '.join(t48_details)})"
+                print(f"Test 48 FAILED: {'; '.join(t48_details)}")
+        except Exception as e:
+            results["Test 48: Cursor-based pagination (before_id and after_id)"] = f"Failed ({e})"
+            print("Test 48 FAILED with exception:", e)
+
+        # Test 49: Parameter validation and authorization bounds
+        print("\n--- Test 49: Parameter validation and authorization bounds ---")
+        try:
+            t49_passed = True
+            t49_details = []
+
+            # 49A: Unregistered history request rejected
+            s_unreg49 = BufferedSocket()
+            s_unreg49.connect((HOST, PORT))
+            s_unreg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-unreg", "conversation_type": "public"}) + "\n").encode('utf-8'))
+            unreg_resp = recv_matching(s_unreg49, ["error"], timeout=2.0)
+            s_unreg49.close()
+            if unreg_resp and unreg_resp.get("code") == "ERR_NOT_REGISTERED":
+                t49_details.append("49A (unregistered client rejected with ERR_NOT_REGISTERED) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49A failed: {unreg_resp}")
+
+            s_reg49 = BufferedSocket()
+            s_reg49.connect((HOST, PORT))
+            s_reg49.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistUser49", "id": "reg-49"}) + "\n").encode('utf-8'))
+            recv_matching(s_reg49, ["register_ack"], timeout=2.0)
+
+            # 49B: Invalid conversation_type rejected
+            s_reg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-bad-conv", "conversation_type": "galactic_chat"}) + "\n").encode('utf-8'))
+            bad_conv_resp = recv_matching(s_reg49, ["error"], timeout=2.0)
+            if bad_conv_resp and bad_conv_resp.get("code") in ["ERR_INVALID_CONVERSATION", "ERR_MALFORMED_MESSAGE"]:
+                t49_details.append("49B (invalid conversation_type rejected) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49B failed: {bad_conv_resp}")
+
+            # 49C: Missing 'with' for direct history rejected
+            s_reg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-no-with", "conversation_type": "direct"}) + "\n").encode('utf-8'))
+            no_with_resp = recv_matching(s_reg49, ["error"], timeout=2.0)
+            if no_with_resp and no_with_resp.get("code") in ["ERR_INVALID_CONVERSATION", "ERR_VALIDATION_FAILED", "ERR_MALFORMED_MESSAGE"]:
+                t49_details.append("49C (direct history without 'with' rejected) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49C failed: {no_with_resp}")
+
+            # 49D: Missing 'room' for room history rejected
+            s_reg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-no-room", "conversation_type": "room"}) + "\n").encode('utf-8'))
+            no_room_resp = recv_matching(s_reg49, ["error"], timeout=2.0)
+            if no_room_resp and no_room_resp.get("code") in ["ERR_INVALID_CONVERSATION", "ERR_VALIDATION_FAILED", "ERR_MALFORMED_MESSAGE"]:
+                t49_details.append("49D (room history without 'room' rejected) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49D failed: {no_room_resp}")
+
+            # 49E: Self direct history rejected
+            s_reg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-self", "conversation_type": "direct", "with": "HistUser49"}) + "\n").encode('utf-8'))
+            self_resp = recv_matching(s_reg49, ["error"], timeout=2.0)
+            if self_resp and self_resp.get("code") in ["ERR_CANNOT_MESSAGE_SELF", "ERR_SELF_DIRECT_MESSAGE", "ERR_INVALID_CONVERSATION"]:
+                t49_details.append("49E (self direct history rejected) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49E failed: {self_resp}")
+
+            # 49F: Oversized limit safely clamped to MAX_HISTORY_LIMIT
+            s_reg49.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-big-lim", "conversation_type": "public", "limit": 9999}) + "\n").encode('utf-8'))
+            big_lim_resp = recv_matching(s_reg49, ["history_resp"], timeout=2.0)
+            if big_lim_resp and big_lim_resp.get("status") == "ok":
+                t49_details.append("49F (oversized limit safely clamped without error) OK")
+            else:
+                t49_passed = False
+                t49_details.append(f"49F failed: {big_lim_resp}")
+
+            s_reg49.close()
+
+            if t49_passed:
+                results["Test 49: Parameter validation and authorization bounds"] = "Passed"
+                print(f"Test 49 PASSED: {'; '.join(t49_details)}")
+            else:
+                results["Test 49: Parameter validation and authorization bounds"] = f"Failed ({'; '.join(t49_details)})"
+                print(f"Test 49 FAILED: {'; '.join(t49_details)}")
+        except Exception as e:
+            results["Test 49: Parameter validation and authorization bounds"] = f"Failed ({e})"
+            print("Test 49 FAILED with exception:", e)
+
+        # Test 50: Escaped characters and Unicode round-tripping
+        print("\n--- Test 50: Escaped characters and Unicode round-tripping ---")
+        try:
+            t50_passed = True
+            t50_details = []
+
+            s_a50 = BufferedSocket()
+            s_a50.connect((HOST, PORT))
+            s_a50.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice50", "id": "reg-a50"}) + "\n").encode('utf-8'))
+            recv_matching(s_a50, ["register_ack"], timeout=2.0)
+
+            s_b50 = BufferedSocket()
+            s_b50.connect((HOST, PORT))
+            s_b50.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob50", "id": "reg-b50"}) + "\n").encode('utf-8'))
+            recv_matching(s_b50, ["register_ack"], timeout=2.0)
+
+            test_payload = "Line 1\nLine 2\tTabbed\n\"Quotes\" & \\Backslashes\\ \u2764\uFE0F utf8 text"
+            s_a50.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-50", "to": "HistBob50", "content": test_payload}) + "\n").encode('utf-8'))
+            recv_matching(s_a50, ["msg_direct_ack"], timeout=2.0)
+            recv_matching(s_b50, ["msg_direct"], timeout=2.0)
+
+            # Retrieve from SQLite history
+            s_a50.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-50", "conversation_type": "direct", "with": "HistBob50"}) + "\n").encode('utf-8'))
+            h50_resp = recv_matching(s_a50, ["history_resp"], timeout=2.0)
+            h50_msgs = h50_resp.get("messages", []) if h50_resp else []
+            retrieved_content = h50_msgs[-1].get("content") if h50_msgs else ""
+
+            if retrieved_content == test_payload:
+                t50_details.append("50 (multiline, escaped quotes, backslashes, and multibyte UTF-8 round-tripped identically) OK")
+            else:
+                t50_passed = False
+                t50_details.append(f"50 failed: len_retrieved={len(retrieved_content)}, len_expected={len(test_payload)}")
+
+            s_a50.close()
+            s_b50.close()
+
+            if t50_passed:
+                results["Test 50: Escaped characters and Unicode round-tripping"] = "Passed"
+                print(f"Test 50 PASSED: {'; '.join(t50_details)}")
+            else:
+                results["Test 50: Escaped characters and Unicode round-tripping"] = f"Failed ({'; '.join(t50_details)})"
+                print(f"Test 50 FAILED: {'; '.join(t50_details)}")
+        except Exception as e:
+            results["Test 50: Escaped characters and Unicode round-tripping"] = f"Failed ({e})"
+            print("Test 50 FAILED with exception:", e)
+
+        # Test 51: History wire limit bounding
+        print("\n--- Test 51: History wire limit bounding ---")
+        try:
+            t51_passed = True
+            t51_details = []
+
+            s_a51 = BufferedSocket()
+            s_a51.connect((HOST, PORT))
+            s_a51.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice51", "id": "reg-a51"}) + "\n").encode('utf-8'))
+            recv_matching(s_a51, ["register_ack"], timeout=2.0)
+
+            s_b51 = BufferedSocket()
+            s_b51.connect((HOST, PORT))
+            s_b51.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob51", "id": "reg-b51"}) + "\n").encode('utf-8'))
+            recv_matching(s_b51, ["register_ack"], timeout=2.0)
+
+            # Send 6 large direct messages (~400 bytes each). Total history payload would be ~2800 bytes.
+            for i in range(6):
+                large_text = f"LargeMsg51 #{i}: " + ("x" * 380)
+                s_a51.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": f"dm-51-{i}", "to": "HistBob51", "content": large_text}) + "\n").encode('utf-8'))
+                recv_matching(s_a51, ["msg_direct_ack"], timeout=2.0)
+                recv_matching(s_b51, ["msg_direct"], timeout=2.0)
+
+            # Request all 6 messages with limit 10
+            s_a51.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-51", "conversation_type": "direct", "with": "HistBob51", "limit": 10}) + "\n").encode('utf-8'))
+            raw_h51_line = s_a51.recv_line(timeout=2.0)
+            wire_len = len(raw_h51_line.encode('utf-8')) + 1 # including newline
+
+            h51_data = json.loads(raw_h51_line)
+            msgs_packed = len(h51_data.get("messages", []))
+
+            if wire_len <= 2048 and msgs_packed < 6 and h51_data.get("has_more") is True:
+                t51_details.append(f"51 (history response dynamically packed {msgs_packed} items into {wire_len} bytes <= 2048, has_more=true) OK")
+            else:
+                t51_passed = False
+                t51_details.append(f"51 failed: wire_len={wire_len}, msgs_packed={msgs_packed}, has_more={h51_data.get('has_more')}")
+
+            s_a51.close()
+            s_b51.close()
+
+            if t51_passed:
+                results["Test 51: Oversized history wire limit bounding"] = "Passed"
+                print(f"Test 51 PASSED: {'; '.join(t51_details)}")
+            else:
+                results["Test 51: Oversized history wire limit bounding"] = f"Failed ({'; '.join(t51_details)})"
+                print(f"Test 51 FAILED: {'; '.join(t51_details)}")
+        except Exception as e:
+            results["Test 51: Oversized history wire limit bounding"] = f"Failed ({e})"
+            print("Test 51 FAILED with exception:", e)
+
+        # Test 52: Room name reuse historical isolation
+        print("\n--- Test 52: Room name reuse historical isolation ---")
+        try:
+            t52_passed = True
+            t52_details = []
+
+            s_a52 = BufferedSocket()
+            s_a52.connect((HOST, PORT))
+            s_a52.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice52", "id": "reg-a52"}) + "\n").encode('utf-8'))
+            recv_matching(s_a52, ["register_ack"], timeout=2.0)
+
+            s_b52 = BufferedSocket()
+            s_b52.connect((HOST, PORT))
+            s_b52.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob52", "id": "reg-b52"}) + "\n").encode('utf-8'))
+            recv_matching(s_b52, ["register_ack"], timeout=2.0)
+
+            # Incarnation 1: Alice creates #recycle52 and sends secret
+            s_a52.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-52-1", "room": "#recycle52"}) + "\n").encode('utf-8'))
+            recv_matching(s_a52, ["room_create_resp"], timeout=2.0)
+
+            s_a52.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "rm-52-1", "room": "#recycle52", "content": "Incarnation1Secret"}) + "\n").encode('utf-8'))
+            recv_matching(s_a52, ["room_msg_ack"], timeout=2.0)
+
+            # Alice leaves room -> room becomes empty and is auto-deleted
+            s_a52.sendall((json.dumps({"version": 1, "type": "room_leave_req", "id": "lv-52-1", "room": "#recycle52"}) + "\n").encode('utf-8'))
+            recv_matching(s_a52, ["room_leave_resp"], timeout=2.0)
+
+            # Incarnation 2: Bob creates room #recycle52 (same room name, new instance ID!)
+            s_b52.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-52-2", "room": "#recycle52"}) + "\n").encode('utf-8'))
+            recv_matching(s_b52, ["room_create_resp"], timeout=2.0)
+
+            # Bob queries room history for #recycle52
+            s_b52.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-52", "conversation_type": "room", "room": "#recycle52"}) + "\n").encode('utf-8'))
+            h52_resp = recv_matching(s_b52, ["history_resp"], timeout=2.0)
+            h52_msgs = h52_resp.get("messages", []) if h52_resp else None
+
+            if h52_msgs == []:
+                t52_details.append("52 (re-created room name does not expose messages from previous room incarnation) OK")
+            else:
+                t52_passed = False
+                t52_details.append(f"52 failed: messages={h52_msgs}")
+
+            s_a52.close()
+            s_b52.close()
+
+            if t52_passed:
+                results["Test 52: Room name reuse historical isolation"] = "Passed"
+                print(f"Test 52 PASSED: {'; '.join(t52_details)}")
+            else:
+                results["Test 52: Room name reuse historical isolation"] = f"Failed ({'; '.join(t52_details)})"
+                print(f"Test 52 FAILED: {'; '.join(t52_details)}")
+        except Exception as e:
+            results["Test 52: Room name reuse historical isolation"] = f"Failed ({e})"
+            print("Test 52 FAILED with exception:", e)
+
+        # Test 53: Simulated storage failure prevents false ACK and false broadcast
+        print("\n--- Test 53: Storage failure handling and zero false ACK/broadcast ---")
+        fail_server = None
+        fail_db = os.path.abspath(f"test_fail_{os.getpid()}.db")
+        try:
+            t53_passed = True
+            t53_details = []
+
+            # Launch failure test server on port 8082 with CHAT_SIMULATE_STORAGE_FAILURE=1
+            fail_server = start_server(port=8082, db_path=fail_db, env={"CHAT_SIMULATE_STORAGE_FAILURE": "1"})
+
+            s_u1 = BufferedSocket()
+            s_u1.connect((HOST, 8082))
+            s_u1.sendall((json.dumps({"version": 1, "type": "register_req", "username": "FailUser1", "id": "reg-f1"}) + "\n").encode('utf-8'))
+            recv_matching(s_u1, ["register_ack"], timeout=2.0)
+
+            s_u2 = BufferedSocket()
+            s_u2.connect((HOST, 8082))
+            s_u2.sendall((json.dumps({"version": 1, "type": "register_req", "username": "FailUser2", "id": "reg-f2"}) + "\n").encode('utf-8'))
+            recv_matching(s_u2, ["register_ack"], timeout=2.0)
+
+            # Public message failure
+            s_u1.sendall((json.dumps({"version": 1, "type": "msg_send", "id": "pub-fail", "content": "Should not be persisted"}) + "\n").encode('utf-8'))
+            f_pub_err = recv_matching(s_u1, ["error"], timeout=2.0)
+            u2_got = s_u2.recv_line(timeout=0.4)
+            if f_pub_err and f_pub_err.get("code") == "ERR_STORAGE_ERROR" and (u2_got == "" or "msg_broadcast" not in u2_got):
+                t53_details.append("53A (public message storage failure returns ERR_STORAGE_ERROR; zero broadcast) OK")
+            else:
+                t53_passed = False
+                t53_details.append(f"53A failed: err={f_pub_err}, u2_got='{u2_got}'")
+
+            # Direct message failure
+            s_u1.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-fail", "to": "FailUser2", "content": "Secret fail"}) + "\n").encode('utf-8'))
+            f_dm_err = recv_matching(s_u1, ["error"], timeout=2.0)
+            u2_got_dm = s_u2.recv_line(timeout=0.4)
+            if f_dm_err and f_dm_err.get("code") == "ERR_STORAGE_ERROR" and (u2_got_dm == "" or "msg_direct" not in u2_got_dm):
+                t53_details.append("53B (direct message storage failure returns ERR_STORAGE_ERROR; zero delivery) OK")
+            else:
+                t53_passed = False
+                t53_details.append(f"53B failed: err={f_dm_err}, u2_got='{u2_got_dm}'")
+
+            # Room message failure
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-f", "room": "#failroom"}) + "\n").encode('utf-8'))
+            recv_matching(s_u1, ["room_create_resp"], timeout=2.0)
+            s_u2.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": "j-f", "room": "#failroom"}) + "\n").encode('utf-8'))
+            recv_matching(s_u2, ["room_join_resp"], timeout=2.0)
+
+            s_u1.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": "rm-fail", "room": "#failroom", "content": "Room fail"}) + "\n").encode('utf-8'))
+            f_rm_err = recv_matching(s_u1, ["error"], timeout=2.0)
+            u2_got_rm = s_u2.recv_line(timeout=0.4)
+            if f_rm_err and f_rm_err.get("code") == "ERR_STORAGE_ERROR" and (u2_got_rm == "" or "room_msg" not in u2_got_rm):
+                t53_details.append("53C (room message storage failure returns ERR_STORAGE_ERROR; zero room broadcast) OK")
+            else:
+                t53_passed = False
+                t53_details.append(f"53C failed: err={f_rm_err}, u2_got='{u2_got_rm}'")
+
+            s_u1.close()
+            s_u2.close()
+
+            if t53_passed:
+                results["Test 53: Storage failure handling and zero false ACK/broadcast"] = "Passed"
+                print(f"Test 53 PASSED: {'; '.join(t53_details)}")
+            else:
+                results["Test 53: Storage failure handling and zero false ACK/broadcast"] = f"Failed ({'; '.join(t53_details)})"
+                print(f"Test 53 FAILED: {'; '.join(t53_details)}")
+        except Exception as e:
+            results["Test 53: Storage failure handling and zero false ACK/broadcast"] = f"Failed ({e})"
+            print("Test 53 FAILED with exception:", e)
+        finally:
+            if fail_server:
+                stop_server(fail_server)
+            cleanup_db(fail_db)
+
+        # Test 54: Concurrent public, direct, and room message storage integrity
+        print("\n--- Test 54: Concurrent public, direct, and room message storage integrity ---")
+        try:
+            con_errors = []
+            num_threads = 6
+
+            def history_worker(tid):
+                try:
+                    s = BufferedSocket()
+                    s.connect((HOST, PORT))
+                    uname = f"ConHist54_{tid}"
+                    s.sendall((json.dumps({"version": 1, "type": "register_req", "username": uname, "id": f"reg54-{tid}"}) + "\n").encode('utf-8'))
+                    recv_matching(s, ["register_ack"], timeout=3.0)
+
+                    # Public message
+                    s.sendall((json.dumps({"version": 1, "type": "msg_send", "id": f"pub54-{tid}", "content": f"ConPub from {tid}"}) + "\n").encode('utf-8'))
+                    ack_pub = recv_matching(s, ["msg_ack"], timeout=3.0)
+                    if not ack_pub:
+                        con_errors.append(f"Thread {tid} pub ack missing")
+
+                    # Direct message to neighbor
+                    target = f"ConHist54_{(tid + 1) % num_threads}"
+                    s.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": f"dm54-{tid}", "to": target, "content": f"ConDM from {tid}"}) + "\n").encode('utf-8'))
+                    ack_dm = recv_matching(s, ["msg_direct_ack", "error"], timeout=3.0)
+                    if not ack_dm:
+                        con_errors.append(f"Thread {tid} dm ack missing")
+
+                    # Room message
+                    rname = "#con54_room"
+                    if tid == 0:
+                        s.sendall((json.dumps({"version": 1, "type": "room_create_req", "id": "c-con54", "room": rname}) + "\n").encode('utf-8'))
+                        recv_matching(s, ["room_create_resp", "error"], timeout=3.0)
+                    else:
+                        time.sleep(0.05)
+                        s.sendall((json.dumps({"version": 1, "type": "room_join_req", "id": f"j-con54-{tid}", "room": rname}) + "\n").encode('utf-8'))
+                        recv_matching(s, ["room_join_resp", "error"], timeout=3.0)
+
+                    s.sendall((json.dumps({"version": 1, "type": "room_msg_req", "id": f"rm54-{tid}", "room": rname, "content": f"ConRoom from {tid}"}) + "\n").encode('utf-8'))
+                    recv_matching(s, ["room_msg_ack", "error"], timeout=3.0)
+
+                    # History query
+                    s.sendall((json.dumps({"version": 1, "type": "history_req", "id": f"h-con54-{tid}", "conversation_type": "public", "limit": 5}) + "\n").encode('utf-8'))
+                    h_resp = recv_matching(s, ["history_resp"], timeout=3.0)
+                    if not h_resp or h_resp.get("status") != "ok":
+                        con_errors.append(f"Thread {tid} history query failed: {h_resp}")
+
+                    s.close()
+                except Exception as ex:
+                    con_errors.append(f"Thread {tid} exception: {ex}")
+
+            th_list = []
+            for i in range(num_threads):
+                t = threading.Thread(target=history_worker, args=(i,))
+                th_list.append(t)
+                t.start()
+
+            for t in th_list:
+                t.join(timeout=8.0)
+
+            if len(con_errors) == 0:
+                results["Test 54: Concurrent public, direct, and room message storage integrity"] = "Passed"
+                print(f"Test 54 PASSED: All {num_threads} concurrent storage threads succeeded without errors.")
+            else:
+                results["Test 54: Concurrent public, direct, and room message storage integrity"] = f"Failed ({con_errors})"
+                print(f"Test 54 FAILED: {con_errors}")
+        except Exception as e:
+            results["Test 54: Concurrent public, direct, and room message storage integrity"] = f"Failed ({e})"
+            print("Test 54 FAILED with exception:", e)
+
+        # Test 55: Disconnect resilience (delivery failure after DB commit does not erase message)
+        print("\n--- Test 55: Disconnect resilience ---")
+        try:
+            t55_passed = True
+            t55_details = []
+
+            s_a55 = BufferedSocket()
+            s_a55.connect((HOST, PORT))
+            s_a55.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistAlice55", "id": "reg-a55"}) + "\n").encode('utf-8'))
+            recv_matching(s_a55, ["register_ack"], timeout=2.0)
+
+            s_b55 = BufferedSocket()
+            s_b55.connect((HOST, PORT))
+            s_b55.sendall((json.dumps({"version": 1, "type": "register_req", "username": "HistBob55", "id": "reg-b55"}) + "\n").encode('utf-8'))
+            recv_matching(s_b55, ["register_ack"], timeout=2.0)
+
+            # Alice sends DM to Bob while Bob is connected
+            s_a55.sendall((json.dumps({"version": 1, "type": "msg_direct_req", "id": "dm-55", "to": "HistBob55", "content": "Persisted Despite Broken Recipient Socket"}) + "\n").encode('utf-8'))
+            ack_55 = recv_matching(s_a55, ["msg_direct_ack"], timeout=2.0)
+            recv_matching(s_b55, ["msg_direct"], timeout=2.0)
+
+            # Bob aborts socket connection abruptly
+            s_b55.set_linger_abort()
+            s_b55.close()
+            time.sleep(0.05)
+
+            # Verify Alice can retrieve the persisted message from history even after Bob disconnected
+            s_a55.sendall((json.dumps({"version": 1, "type": "history_req", "id": "h-55", "conversation_type": "direct", "with": "HistBob55"}) + "\n").encode('utf-8'))
+            h55_resp = recv_matching(s_a55, ["history_resp"], timeout=2.0)
+            h55_msgs = [m.get("content") for m in h55_resp.get("messages", [])] if h55_resp else []
+
+            if ack_55 and ack_55.get("status") == "ok" and "Persisted Despite Broken Recipient Socket" in h55_msgs:
+                t55_details.append("55 (message committed to SQLite survives recipient socket delivery abort) OK")
+            else:
+                t55_passed = False
+                t55_details.append(f"55 failed: ack={ack_55}, msgs={h55_msgs}")
+
+            s_a55.close()
+
+            if t55_passed:
+                results["Test 55: Disconnect resilience (delivery failure after DB commit does not erase message)"] = "Passed"
+                print(f"Test 55 PASSED: {'; '.join(t55_details)}")
+            else:
+                results["Test 55: Disconnect resilience (delivery failure after DB commit does not erase message)"] = f"Failed ({'; '.join(t55_details)})"
+                print(f"Test 55 FAILED: {'; '.join(t55_details)}")
+        except Exception as e:
+            results["Test 55: Disconnect resilience (delivery failure after DB commit does not erase message)"] = f"Failed ({e})"
+            print("Test 55 FAILED with exception:", e)
+
     finally:
         stop_server(srv_struct)
+        cleanup_db(TEST_DB)
 
     print("\n================ FINAL TEST SUMMARY ================")
     all_passed = True
