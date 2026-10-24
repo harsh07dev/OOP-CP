@@ -4,11 +4,21 @@ project(TCPChatApplication CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Platform-specific socket and threading libraries
-if(WIN32)
-    set(PLATFORM_LIBS ws2_32)
+# Compiler warning flags
+if(MSVC)
+    add_compile_options(/W4)
 else()
-    set(PLATFORM_LIBS pthread)
+    add_compile_options(-Wall -Wextra)
+endif()
+
+# Threading library
+find_package(Threads REQUIRED)
+
+# Platform-specific socket libraries
+if(WIN32)
+    set(PLATFORM_NETWORK_LIBS ws2_32)
+else()
+    set(PLATFORM_NETWORK_LIBS "")
 endif()
 
 # Shared common protocol and data structures
@@ -22,9 +32,7 @@ add_executable(chat_server
     server/src/logger.cpp
 )
 target_include_directories(chat_server PRIVATE server/include common/include)
-if(PLATFORM_LIBS)
-    target_link_libraries(chat_server PRIVATE ${PLATFORM_LIBS})
-endif()
+target_link_libraries(chat_server PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS})
 
 # Client executable target
 add_executable(chat_client
@@ -34,6 +42,4 @@ add_executable(chat_client
     client/src/receiver.cpp
 )
 target_include_directories(chat_client PRIVATE client/include common/include)
-if(PLATFORM_LIBS)
-    target_link_libraries(chat_client PRIVATE ${PLATFORM_LIBS})
-endif()
+target_link_libraries(chat_client PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS})

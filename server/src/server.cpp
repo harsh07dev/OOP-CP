@@ -1,8 +1,9 @@
-// server.cpp - Implementation of the Server class for Windows Winsock.
+// server.cpp - Implementation of the Server class for cross-platform TCP chat.
 // Handles TCP socket creation, binding, listening, and concurrent client handling with dedicated worker threads.
 
 #include "server.h"
 #include "protocol.h"
+#include "net_compat.h"
 
 #include <iostream>
 #include <cstring>
@@ -14,7 +15,7 @@ Server::Server(int port)
       m_logger("logs/chat.log"),
       m_clientManager(&m_logger),
       m_isRunning(false),
-      m_wsaInitialized(false)
+      m_netInitialized(false)
 {
     std::memset(&m_serverAddr, 0, sizeof(m_serverAddr));
 }
@@ -67,19 +68,22 @@ bool Server::acceptClient() {
     std::cout << "Waiting for client connection..." << std::endl;
 
     sockaddr_in clientAddr;
-    int clientAddrLen = sizeof(clientAddr);
+    socklen_t clientAddrLen = sizeof(clientAddr);
     std::memset(&clientAddr, 0, sizeof(clientAddr));
 
     // accept() blocks until an incoming connection arrives on the listening socket
     SOCKET clientSocket = accept(m_serverSocket, reinterpret_cast<SOCKADDR*>(&clientAddr), &clientAddrLen);
     if (clientSocket == INVALID_SOCKET) {
-        int err = WSAGetLastError();
+        int err = netGetLastError();
         // If the server was stopped (e.g., via signal handler closing m_serverSocket), exit cleanly
-        if (!m_isRunning || err == WSAEINTR || err == WSAENOTSOCK) {
+        if (!m_isRunning || netIsInterrupted(err) || netIsBadSocket(err)) {
             return false;
         }
+        if (netIsConnAbortedOrReset(err)) {
+            return true; // Transient client disconnect before accept completed; keep accepting
+        }
         m_logger.error("accept() failed with error code: " + std::to_string(err));
-        return false;
+        return true;
     }
 
     // Extract client IP and port for reporting
@@ -92,16 +96,32 @@ bool Server::acceptClient() {
 
     m_logger.info("Client connected: " + clientEndpoint);
 
-    // Spawn a dedicated worker thread for this accepted client connection.
-    // Detach the thread so that it runs independently, allowing the main thread
-    // to immediately return to accept() and handle additional incoming clients concurrently.
-    std::thread clientThread(&Server::handleClient, this, clientSocket, clientAddr);
-    clientThread.detach();
+    // Spawn and track a dedicated worker thread for this accepted client connection.
+    auto doneFlag = std::make_shared<std::atomic<bool>>(false);
+    auto isClosed = std::make_shared<std::atomic<bool>>(false);
+    std::thread clientThread([this, clientSocket, clientAddr, doneFlag, isClosed]() {
+        handleClient(clientSocket, clientAddr, isClosed);
+        doneFlag->store(true);
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(m_threadsMutex);
+        // Clean up previously completed worker records
+        for (auto it = m_workers.begin(); it != m_workers.end(); ) {
+            if (it->done->load() && it->th.joinable()) {
+                it->th.join();
+                it = m_workers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        m_workers.push_back({std::move(clientThread), doneFlag, clientSocket, isClosed});
+    }
 
     return true;
 }
 
-void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
+void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shared_ptr<std::atomic<bool>> isClosed) {
     char ipBuffer[INET_ADDRSTRLEN] = {0};
     if (inet_ntop(AF_INET, &(clientAddr.sin_addr), ipBuffer, sizeof(ipBuffer)) == nullptr) {
         std::strncpy(ipBuffer, "Unknown", sizeof(ipBuffer) - 1);
@@ -129,6 +149,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
             bool shouldExit = false;
 
             while ((newlinePos = receiveBuffer.find(protocol::DELIMITER)) != std::string::npos) {
+                size_t wireSize = newlinePos + 1;
                 std::string line = receiveBuffer.substr(0, newlinePos);
                 receiveBuffer.erase(0, newlinePos + 1);
 
@@ -137,9 +158,23 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                     line.pop_back();
                 }
 
+                // Check message size limit (MAX_MESSAGE_SIZE = 2048 bytes wire size including DELIMITER)
+                if (wireSize > protocol::MAX_MESSAGE_SIZE) {
+                    if (!isRegistered) {
+                        m_logger.warning("Client registration rejected: message exceeds MAX_MESSAGE_SIZE (" + std::to_string(wireSize) + " > " + std::to_string(protocol::MAX_MESSAGE_SIZE) + ") (" + clientEndpoint + ")");
+                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                        shouldExit = true;
+                        break;
+                    } else {
+                        m_logger.warning("Rejected oversized message (" + std::to_string(wireSize) + " bytes) from " + registeredUsername);
+                        continue;
+                    }
+                }
+
                 // First message must be interpreted as username registration
                 if (!isRegistered) {
-                    RegistrationResult res = m_clientManager.registerClient(clientSocket, line, clientAddr);
+                    RegistrationResult res = m_clientManager.registerClient(clientSocket, line, clientAddr, isClosed);
 
                     if (res == RegistrationResult::INVALID_USERNAME) {
                         m_logger.warning("Client registration rejected: invalid username '" + line + "' (" + clientEndpoint + ")");
@@ -191,6 +226,11 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
                     break;
                 }
 
+                // Suppress empty chat lines
+                if (line.empty()) {
+                    continue;
+                }
+
                 // Log received normal chat message as a CHAT event
                 m_logger.chat("[" + registeredUsername + "]: " + line);
 
@@ -202,14 +242,20 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
             if (shouldExit) {
                 break;
             }
+
+            // Bound per-client receive buffer to prevent memory exhaustion without delimiter
+            if (receiveBuffer.size() > protocol::MAX_MESSAGE_SIZE) {
+                m_logger.warning("Client exceeded MAX_MESSAGE_SIZE without delimiter (" + std::to_string(receiveBuffer.size()) + " bytes) from " + (isRegistered ? registeredUsername : clientEndpoint) + ". Terminating connection.");
+                break;
+            }
         }
         else if (bytesReceived == 0) {
             // Client closed connection gracefully
             break;
         }
         else {
-            int err = WSAGetLastError();
-            if (m_isRunning && err != WSAEINTR && err != WSAECONNRESET && err != WSAENOTSOCK) {
+            int err = netGetLastError();
+            if (m_isRunning && !netIsInterrupted(err) && !netIsBadSocket(err) && !netIsConnAbortedOrReset(err)) {
                 m_logger.error("recv() failed for " + (isRegistered ? registeredUsername : clientEndpoint)
                                + " with error code: " + std::to_string(err));
             }
@@ -220,46 +266,53 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr) {
     // Unregister client from ClientManager before broadcasting leave notification
     if (isRegistered) {
         std::string departingUser = registeredUsername;
-        m_clientManager.removeClient(clientSocket);
+        bool removed = m_clientManager.removeClient(clientSocket);
         isRegistered = false;
 
-        if (userRequestedQuit) {
-            m_logger.info("User left: " + departingUser + " (requested disconnect)");
-        } else {
-            m_logger.info("User disconnected: " + departingUser);
-        }
+        if (removed) {
+            if (userRequestedQuit) {
+                m_logger.info("User left: " + departingUser + " (requested disconnect)");
+            } else {
+                m_logger.info("User disconnected: " + departingUser);
+            }
 
-        // Broadcast leave notification to all remaining connected clients
-        std::string leaveNotification = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat." + protocol::DELIMITER;
-        m_clientManager.broadcastMessage(leaveNotification, clientSocket);
+            // Broadcast leave notification to all remaining connected clients
+            std::string leaveNotification = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat." + protocol::DELIMITER;
+            m_clientManager.broadcastMessage(leaveNotification, clientSocket);
+        }
     }
 
-    // Cleanly close this worker's client socket exactly once
-    closesocket(clientSocket);
+    // Safely close this worker's client socket exactly once
+    if (isClosed && !isClosed->exchange(true)) {
+        netShutdownSocket(clientSocket, NET_SHUTDOWN_RDWR);
+        netCloseSocket(clientSocket);
+    }
 }
 
 bool Server::initializeSocket() {
-    // Initialize Windows Winsock 2.2
-    WSADATA wsaData;
-    int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (wsaResult != 0) {
-        m_logger.error("WSAStartup failed with error code: " + std::to_string(wsaResult));
+    if (!netInit()) {
+        int err = netGetLastError();
+        m_logger.error("Network initialization failed with error code: " + std::to_string(err));
         return false;
     }
-    m_wsaInitialized = true;
+    m_netInitialized = true;
+#if defined(_WIN32)
     m_logger.info("Winsock initialized.");
+#else
+    m_logger.info("POSIX networking initialized (SIGPIPE ignored).");
+#endif
 
     // Create IPv4 TCP stream socket
     m_serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (m_serverSocket == INVALID_SOCKET) {
-        m_logger.error("socket() creation failed with error code: " + std::to_string(WSAGetLastError()));
+        m_logger.error("socket() creation failed with error code: " + std::to_string(netGetLastError()));
         return false;
     }
 
     // Set SO_REUSEADDR to enable immediate reuse of the local address/port upon restart
     int opt = 1;
     if (setsockopt(m_serverSocket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt)) == SOCKET_ERROR) {
-        m_logger.warning("setsockopt(SO_REUSEADDR) failed with error code: " + std::to_string(WSAGetLastError()));
+        m_logger.warning("setsockopt(SO_REUSEADDR) failed with error code: " + std::to_string(netGetLastError()));
     }
 
     // Configure the server address structure to listen on all local network interfaces (0.0.0.0)
@@ -275,14 +328,14 @@ bool Server::bindSocket() {
     // Bind the listening socket to port 8080 on 0.0.0.0
     int result = bind(m_serverSocket, reinterpret_cast<SOCKADDR*>(&m_serverAddr), sizeof(m_serverAddr));
     if (result == SOCKET_ERROR) {
-        int err = WSAGetLastError();
+        int err = netGetLastError();
         m_logger.error("bind() failed on port " + std::to_string(m_port) + " with error code: " + std::to_string(err));
 
-        if (err == WSAEADDRINUSE) {
+        if (netIsAddrInUse(err)) {
             m_logger.error("Diagnosis: Port " + std::to_string(m_port) + " is already in use by another application.");
-        } else if (err == WSAEACCES) {
+        } else if (netIsAccessDenied(err)) {
             m_logger.error("Diagnosis: Access denied. Insufficient permissions to bind to port " + std::to_string(m_port) + ".");
-        } else if (err == WSAENOTSOCK) {
+        } else if (netIsBadSocket(err)) {
             m_logger.error("Diagnosis: Invalid socket descriptor specified.");
         } else {
             m_logger.error("Diagnosis: Check socket state or network configuration.");
@@ -297,7 +350,7 @@ bool Server::startListening() {
     constexpr int BACKLOG = 5;
     int result = listen(m_serverSocket, BACKLOG);
     if (result == SOCKET_ERROR) {
-        m_logger.error("listen() failed with error code: " + std::to_string(WSAGetLastError()));
+        m_logger.error("listen() failed with error code: " + std::to_string(netGetLastError()));
         return false;
     }
     return true;
@@ -305,30 +358,56 @@ bool Server::startListening() {
 
 void Server::closeSocket(SOCKET& s) {
     if (s != INVALID_SOCKET) {
-        closesocket(s);
+        netShutdownSocket(s, NET_SHUTDOWN_RDWR);
+        netCloseSocket(s);
         s = INVALID_SOCKET;
     }
 }
 
 void Server::cleanup() {
-    // Close the primary listening server socket if currently open
-    closeSocket(m_serverSocket);
-
-    // Clean up Winsock subsystem
-    if (m_wsaInitialized) {
-        WSACleanup();
-        m_wsaInitialized = false;
-    }
-
-    m_isRunning = false;
+    stop();
 }
 
 void Server::stop() {
-    if (m_isRunning) {
-        m_logger.info("Server shutting down.");
-        cleanup();
-        m_logger.info("Server stopped.");
+    if (!m_isRunning.exchange(false)) {
+        return;
     }
+
+    m_logger.info("Server shutting down.");
+
+    // 1. Close listening socket so accept() unblocks
+    closeSocket(m_serverSocket);
+
+    // 2. Close active client connections so blocking recv() unblocks
+    m_clientManager.closeAllClients();
+
+    {
+        std::lock_guard<std::mutex> lock(m_threadsMutex);
+        for (auto& worker : m_workers) {
+            if (worker.isClosed && !worker.isClosed->exchange(true)) {
+                netShutdownSocket(worker.socket, NET_SHUTDOWN_RDWR);
+                netCloseSocket(worker.socket);
+            }
+        }
+    }
+
+    // 3. Join all tracked worker threads
+    {
+        std::lock_guard<std::mutex> lock(m_threadsMutex);
+        for (auto& worker : m_workers) {
+            if (worker.th.joinable()) {
+                worker.th.join();
+            }
+        }
+        m_workers.clear();
+    }
+
+    // 4. Clean up network subsystem
+    if (m_netInitialized.exchange(false)) {
+        netCleanup();
+    }
+
+    m_logger.info("Server stopped.");
 }
 
 bool Server::isRunning() const {

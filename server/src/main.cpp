@@ -3,26 +3,69 @@
 // spawning a dedicated worker thread per client.
 
 #include "server.h"
+#include "net_compat.h"
 
 #include <iostream>
 #include <csignal>
+#include <atomic>
+
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
 
 namespace {
+    std::atomic<bool> g_stopRequested{false};
     Server* g_serverInstance = nullptr;
 
     void handleSignal(int signum) {
-        if (signum == SIGINT || signum == SIGTERM) {
+        (void)signum;
+        g_stopRequested.store(true);
+#ifdef _WIN32
+        if (g_serverInstance != nullptr) {
+            g_serverInstance->stop();
+        }
+#else
+        // On Linux / POSIX systems, signal handlers must remain strictly async-signal-safe.
+        // Complex operations (mutex locking, thread joining, heap allocations, and stream I/O)
+        // are avoided here. The main accept() loop is interrupted with EINTR (configured via
+        // sigaction without SA_RESTART), allowing graceful coordinated shutdown on the main thread.
+#endif
+    }
+
+#ifdef _WIN32
+    BOOL WINAPI consoleCtrlHandler(DWORD ctrlType) {
+        if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
+            g_stopRequested.store(true);
             if (g_serverInstance != nullptr) {
                 g_serverInstance->stop();
             }
+            return TRUE;
         }
+        return FALSE;
     }
+#endif
 }
 
 int main() {
-    // Register signal handlers for clean termination on SIGINT (Ctrl+C) and SIGTERM
+#ifdef _WIN32
+    // Register Windows console control and signal handlers
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
+    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+#else
+    // Configure POSIX signal handling with sigaction.
+    // Explicitly omit SA_RESTART so blocking network syscalls (e.g. accept) unblock with EINTR.
+    struct sigaction sa{};
+    sa.sa_handler = handleSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    std::signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE so broken client sockets do not terminate server
+#endif
 
     constexpr int SERVER_PORT = 8080;
 
@@ -39,11 +82,15 @@ int main() {
     // 3. Continuously accept clients on the main thread.
     // Each accepted client is dispatched to an independent worker thread inside acceptClient(),
     // allowing multiple clients to remain connected simultaneously.
-    while (server.isRunning()) {
+    while (server.isRunning() && !g_stopRequested.load()) {
         if (!server.acceptClient()) {
             break;
         }
     }
+
+    // Coordinated teardown on main thread (safe across both platforms)
+    server.stop();
+    g_serverInstance = nullptr;
 
     return 0;
 }

@@ -1,0 +1,60 @@
+name: Linux Server Build & Test
+
+on:
+  push:
+    branches: [ main, Server-side ]
+  pull_request:
+    branches: [ main, Server-side ]
+  workflow_dispatch:
+
+jobs:
+  ubuntu-build-and-test:
+    name: Ubuntu Build & Regression Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake python3
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
+
+      - name: Build server (chat_server)
+        run: |
+          cmake --build build --config Release --target chat_server --verbose
+
+      - name: Build client (chat_client)
+        run: |
+          cmake --build build --config Release --target chat_client --verbose
+
+      - name: Run cross-platform regression test suite
+        run: |
+          python3 tests/regression_tests.py
+
+      - name: Display server logs on failure
+        if: failure()
+        run: |
+          if [ -f logs/chat.log ]; then
+            echo "=========================================="
+            echo "           SERVER RUNTIME LOGS            "
+            echo "=========================================="
+            cat logs/chat.log
+          else
+            echo "No log file found at logs/chat.log"
+          fi
+
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-server-linux-logs
+          path: logs/
+          if-no-files-found: ignore

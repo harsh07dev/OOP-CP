@@ -1,18 +1,25 @@
-// server.h - Declaration of the Server class for Windows Winsock.
+// server.h - Declaration of the Server class for cross-platform TCP chat.
 // Manages server socket setup, binding, listening, and accepting client connections concurrently with worker threads.
 
 #pragma once
 
-#ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "net_compat.h"
 #include <thread>
 #include <string>
+#include <atomic>
+#include <vector>
+#include <memory>
+#include <mutex>
 
 #include "client_manager.h"
 #include "logger.h"
+
+struct WorkerRecord {
+    std::thread th;
+    std::shared_ptr<std::atomic<bool>> done;
+    SOCKET socket{INVALID_SOCKET};
+    std::shared_ptr<std::atomic<bool>> isClosed;
+};
 
 class Server {
 public:
@@ -49,7 +56,7 @@ private:
     void closeSocket(SOCKET& s);
 
     // Dedicated worker thread handler per connected client
-    void handleClient(SOCKET clientSocket, sockaddr_in clientAddr);
+    void handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shared_ptr<std::atomic<bool>> isClosed);
 
     // State required for server networking and client management
     int m_port;
@@ -57,6 +64,10 @@ private:
     sockaddr_in m_serverAddr; // Server address configuration
     Logger m_logger;          // Thread-safe timestamped logger
     ClientManager m_clientManager; // Thread-safe active client registry
-    bool m_isRunning;
-    bool m_wsaInitialized;
+    std::atomic<bool> m_isRunning;
+    std::atomic<bool> m_netInitialized;
+
+    // Thread tracking to ensure coordinated shutdown and zero detached threads
+    std::mutex m_threadsMutex;
+    std::vector<WorkerRecord> m_workers;
 };
