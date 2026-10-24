@@ -11,6 +11,9 @@
 #include <memory>
 #include <atomic>
 
+#include "protocol.h"
+#include "protocol_message.h"
+
 // Structure holding connection and identity metadata for an active client
 struct ClientInfo {
     SOCKET socket{INVALID_SOCKET};
@@ -18,6 +21,7 @@ struct ClientInfo {
     sockaddr_in address{};
     std::shared_ptr<std::mutex> sendMutex{std::make_shared<std::mutex>()};
     std::shared_ptr<std::atomic<bool>> isClosed{std::make_shared<std::atomic<bool>>(false)};
+    protocol::ProtocolVersion protocolVersion{protocol::ProtocolVersion::LEGACY_V0};
 };
 
 enum class RegistrationResult {
@@ -42,7 +46,7 @@ public:
     void setLogger(Logger* logger);
 
     // Thread-safe atomic validation, duplicate check (case-insensitive), and registration
-    RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed = nullptr);
+    RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed = nullptr, protocol::ProtocolVersion protocolVersion = protocol::ProtocolVersion::LEGACY_V0);
 
     // Thread-safe check if a username is currently taken (case-insensitive)
     bool isUsernameTaken(const std::string& username) const;
@@ -62,12 +66,19 @@ public:
     // Thread-safe retrieval of specific client information
     bool getClientInfo(SOCKET socket, ClientInfo& outInfo) const;
 
+    // Thread-safe retrieval of a client's negotiated protocol version
+    bool getClientProtocolVersion(SOCKET socket, protocol::ProtocolVersion& outVersion) const;
+
     // Thread-safe snapshot of all active clients
     std::vector<ClientInfo> getAllClients() const;
 
     // Thread-safe message broadcasting to all connected clients except senderSocket.
     // Snapshots recipients under the mutex and executes network send() calls outside the lock.
     void broadcastMessage(const std::string& message, SOCKET senderSocket = INVALID_SOCKET);
+
+    // Thread-safe dual-mode broadcasting: sends structured JSON to structured clients (v1)
+    // and legacy formatted text to legacy clients (v0).
+    void broadcastStructured(const protocol::StructuredMessage& structuredMsg, const std::string& legacyText, SOCKET senderSocket = INVALID_SOCKET);
 
     // Reliable send helper handling partial sends across TCP byte streams
     static bool sendAll(SOCKET sock, const std::string& data, const std::string& username, Logger* logger = nullptr);

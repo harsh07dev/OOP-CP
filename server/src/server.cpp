@@ -3,11 +3,13 @@
 
 #include "server.h"
 #include "protocol.h"
+#include "protocol_message.h"
 #include "net_compat.h"
 
 #include <iostream>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 
 Server::Server(int port)
     : m_port(port),
@@ -133,6 +135,7 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
     bool isRegistered = false;
     std::string registeredUsername;
     bool userRequestedQuit = false;
+    protocol::ProtocolVersion clientProto = protocol::ProtocolVersion::LEGACY_V0;
 
     constexpr size_t RAW_BUFFER_SIZE = 1024;
     char rawBuffer[RAW_BUFFER_SIZE];
@@ -162,81 +165,271 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                 if (wireSize > protocol::MAX_MESSAGE_SIZE) {
                     if (!isRegistered) {
                         m_logger.warning("Client registration rejected: message exceeds MAX_MESSAGE_SIZE (" + std::to_string(wireSize) + " > " + std::to_string(protocol::MAX_MESSAGE_SIZE) + ") (" + clientEndpoint + ")");
-                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
-                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                        if (protocol::StructuredMessage::isAttemptedStructured(line)) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Message exceeds MAX_MESSAGE_SIZE");
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                        } else {
+                            std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                            ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                        }
                         shouldExit = true;
                         break;
                     } else {
                         m_logger.warning("Rejected oversized message (" + std::to_string(wireSize) + " bytes) from " + registeredUsername);
+                        if (clientProto == protocol::ProtocolVersion::STRUCTURED_V1) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE, "Message exceeds MAX_MESSAGE_SIZE");
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                        }
                         continue;
                     }
                 }
 
                 // First message must be interpreted as username registration
                 if (!isRegistered) {
-                    RegistrationResult res = m_clientManager.registerClient(clientSocket, line, clientAddr, isClosed);
+                    if (protocol::StructuredMessage::isAttemptedStructured(line)) {
+                        // Structured Protocol (v1) Registration
+                        clientProto = protocol::ProtocolVersion::STRUCTURED_V1;
+                        protocol::StructuredMessage reqMsg;
+                        std::string parseErr;
+                        if (!protocol::StructuredMessage::deserialize(line, reqMsg, parseErr)) {
+                            m_logger.warning("Structured registration rejected: JSON parse error (" + parseErr + ") from " + clientEndpoint);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MALFORMED_MESSAGE, "Malformed JSON registration: " + parseErr);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
 
-                    if (res == RegistrationResult::INVALID_USERNAME) {
-                        m_logger.warning("Client registration rejected: invalid username '" + line + "' (" + clientEndpoint + ")");
-                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
-                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
-                        shouldExit = true;
-                        break;
+                        if (reqMsg.version != protocol::CURRENT_VERSION) {
+                            m_logger.warning("Structured registration rejected: unsupported version " + std::to_string(reqMsg.version) + " from " + clientEndpoint);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_UNSUPPORTED_VERSION, "Unsupported protocol version", reqMsg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        if (reqMsg.type != protocol::TYPE_REGISTER_REQ) {
+                            m_logger.warning("Structured registration rejected: expected register_req but got " + reqMsg.type + " from " + clientEndpoint);
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_UNKNOWN_TYPE, "Expected register_req", reqMsg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        std::string username = reqMsg.username;
+                        RegistrationResult res = m_clientManager.registerClient(
+                            clientSocket, username, clientAddr, isClosed, protocol::ProtocolVersion::STRUCTURED_V1);
+
+                        if (res == RegistrationResult::INVALID_USERNAME) {
+                            m_logger.warning("Structured registration rejected: invalid username '" + username + "' (" + clientEndpoint + ")");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_INVALID_USERNAME, "Invalid username format", reqMsg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        } else if (res == RegistrationResult::DUPLICATE_USERNAME) {
+                            m_logger.warning("Structured registration rejected: duplicate username '" + username + "' (" + clientEndpoint + ")");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_USERNAME_TAKEN, "Username '" + username + "' is already taken", reqMsg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        } else if (res != RegistrationResult::SUCCESS) {
+                            m_logger.error("Failed to register structured client: " + username + " (" + clientEndpoint + ")");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_INVALID_USERNAME, "Registration failed", reqMsg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        // Registration succeeded
+                        isRegistered = true;
+                        registeredUsername = username;
+                        m_logger.info("User registered (Structured v1): " + registeredUsername + " (" + clientEndpoint + ")");
+                        m_logger.info("User joined: " + registeredUsername);
+
+                        // Send register_ack
+                        auto ack = protocol::StructuredMessage::createRegisterAck(registeredUsername, reqMsg.id);
+                        if (!ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger)) {
+                            m_logger.error("Failed to send register_ack to " + registeredUsername);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        // Broadcast join notification to all other clients
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        std::string legacyJoin = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat.";
+                        auto structJoin = protocol::StructuredMessage::createSystemEvent(
+                            protocol::EVENT_JOIN, registeredUsername, legacyJoin, nowSec);
+                        m_clientManager.broadcastStructured(structJoin, legacyJoin, clientSocket);
+
+                        continue;
+                    } else {
+                        // Legacy Protocol (v0) Registration
+                        clientProto = protocol::ProtocolVersion::LEGACY_V0;
+                        RegistrationResult res = m_clientManager.registerClient(
+                            clientSocket, line, clientAddr, isClosed, protocol::ProtocolVersion::LEGACY_V0);
+
+                        if (res == RegistrationResult::INVALID_USERNAME) {
+                            m_logger.warning("Client registration rejected: invalid username '" + line + "' (" + clientEndpoint + ")");
+                            std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                            ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+                        else if (res == RegistrationResult::DUPLICATE_USERNAME) {
+                            m_logger.warning("Client registration rejected: duplicate username '" + line + "' (" + clientEndpoint + ")");
+                            std::string resp = std::string(protocol::RESP_ERR_USERNAME_TAKEN) + protocol::DELIMITER;
+                            ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+                        else if (res != RegistrationResult::SUCCESS) {
+                            m_logger.error("Failed to register client: " + line + " (" + clientEndpoint + ")");
+                            std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
+                            ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        // Registration succeeded
+                        isRegistered = true;
+                        registeredUsername = line;
+                        m_logger.info("User registered (Legacy v0): " + registeredUsername + " (" + clientEndpoint + ")");
+                        m_logger.info("User joined: " + registeredUsername);
+
+                        // Send OK acknowledgement directly to the registering client
+                        std::string okResp = std::string(protocol::RESP_OK) + protocol::DELIMITER;
+                        if (!ClientManager::sendAll(clientSocket, okResp, registeredUsername, &m_logger)) {
+                            m_logger.error("Failed to send OK response to " + registeredUsername);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        // Broadcast join notification to all other connected clients
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        std::string legacyJoin = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat.";
+                        auto structJoin = protocol::StructuredMessage::createSystemEvent(
+                            protocol::EVENT_JOIN, registeredUsername, legacyJoin, nowSec);
+                        m_clientManager.broadcastStructured(structJoin, legacyJoin, clientSocket);
+
+                        continue;
                     }
-                    else if (res == RegistrationResult::DUPLICATE_USERNAME) {
-                        m_logger.warning("Client registration rejected: duplicate username '" + line + "' (" + clientEndpoint + ")");
-                        std::string resp = std::string(protocol::RESP_ERR_USERNAME_TAKEN) + protocol::DELIMITER;
-                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
-                        shouldExit = true;
-                        break;
-                    }
-                    else if (res != RegistrationResult::SUCCESS) {
-                        m_logger.error("Failed to register client: " + line + " (" + clientEndpoint + ")");
-                        std::string resp = std::string(protocol::RESP_ERR_INVALID_USERNAME) + protocol::DELIMITER;
-                        ClientManager::sendAll(clientSocket, resp, clientEndpoint, &m_logger);
-                        shouldExit = true;
-                        break;
-                    }
-
-                    // Registration succeeded
-                    isRegistered = true;
-                    registeredUsername = line;
-                    m_logger.info("User registered: " + registeredUsername + " (" + clientEndpoint + ")");
-                    m_logger.info("User joined: " + registeredUsername);
-
-                    // Send OK acknowledgement directly to the registering client
-                    std::string okResp = std::string(protocol::RESP_OK) + protocol::DELIMITER;
-                    if (!ClientManager::sendAll(clientSocket, okResp, registeredUsername, &m_logger)) {
-                        m_logger.error("Failed to send OK response to " + registeredUsername);
-                        shouldExit = true;
-                        break;
-                    }
-
-                    // Broadcast join notification to all other connected clients
-                    std::string joinNotification = std::string(protocol::PREFIX_SYSTEM) + " " + registeredUsername + " has joined the chat." + protocol::DELIMITER;
-                    m_clientManager.broadcastMessage(joinNotification, clientSocket);
-
-                    continue; // First message handled; proceed to next line or next recv
                 }
 
-                // Handle graceful disconnect command (/quit)
-                if (line == protocol::CMD_QUIT) {
-                    userRequestedQuit = true;
-                    shouldExit = true;
-                    break;
+                // Handle post-registration messages
+                if (clientProto == protocol::ProtocolVersion::STRUCTURED_V1) {
+                    if (!protocol::StructuredMessage::isAttemptedStructured(line)) {
+                        m_logger.warning("Malformed message from " + registeredUsername + ": expected JSON object");
+                        auto errResp = protocol::StructuredMessage::createError(
+                            protocol::ERR_MALFORMED_MESSAGE, "Expected JSON object");
+                        ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                        continue;
+                    }
+
+                    protocol::StructuredMessage msg;
+                    std::string parseErr;
+                    if (!protocol::StructuredMessage::deserialize(line, msg, parseErr)) {
+                        m_logger.warning("JSON parse error from " + registeredUsername + ": " + parseErr);
+                        auto errResp = protocol::StructuredMessage::createError(
+                            protocol::ERR_MALFORMED_MESSAGE, "Failed to parse JSON: " + parseErr);
+                        ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                        continue;
+                    }
+
+                    if (msg.version != protocol::CURRENT_VERSION) {
+                        auto errResp = protocol::StructuredMessage::createError(
+                            protocol::ERR_UNSUPPORTED_VERSION, "Unsupported protocol version", msg.id);
+                        ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                        continue;
+                    }
+
+                    if (msg.type == protocol::TYPE_DISCONNECT_REQ) {
+                        userRequestedQuit = true;
+                        shouldExit = true;
+                        break;
+                    }
+                    else if (msg.type == protocol::TYPE_MSG_SEND) {
+                        if (msg.content.empty()) {
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_EMPTY_MESSAGE, "Message content cannot be empty", msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        std::string msgId = "msg-" + std::to_string(++m_messageSequence);
+                        int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+
+                        // Prepare structured broadcast envelope
+                        auto structBroadcast = protocol::StructuredMessage::createMsgBroadcast(
+                            registeredUsername, msg.content, msgId, nowSec, msg.to, msg.room);
+
+                        // Enforce wire-size constraint: serialized JSON envelope must remain within MAX_MESSAGE_SIZE
+                        if (structBroadcast.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+                            m_logger.warning("Message from " + registeredUsername + " rejected: serialized envelope exceeds MAX_MESSAGE_SIZE (" +
+                                             std::to_string(structBroadcast.serializeWire().size()) + " > " +
+                                             std::to_string(protocol::MAX_MESSAGE_SIZE) + ")");
+                            auto errResp = protocol::StructuredMessage::createError(
+                                protocol::ERR_MESSAGE_TOO_LARGE,
+                                "Serialized message envelope exceeds MAX_MESSAGE_SIZE wire limit",
+                                msg.id);
+                            ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                            continue;
+                        }
+
+                        // Send msg_ack to sender
+                        auto ack = protocol::StructuredMessage::createMsgAck(msgId, msg.id);
+                        ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger);
+
+                        // Log received normal chat message as a CHAT event
+                        m_logger.chat("[" + registeredUsername + "]: " + msg.content);
+
+                        // Broadcast chat message to all other connected clients
+                        std::string legacyBroadcast = "[" + registeredUsername + "]: " + msg.content;
+                        m_clientManager.broadcastStructured(structBroadcast, legacyBroadcast, clientSocket);
+                    }
+                    else {
+                        m_logger.warning("Unknown message type '" + msg.type + "' from " + registeredUsername);
+                        auto errResp = protocol::StructuredMessage::createError(
+                            protocol::ERR_UNKNOWN_TYPE, "Unknown message type: " + msg.type, msg.id);
+                        ClientManager::sendAll(clientSocket, errResp.serializeWire(), registeredUsername, &m_logger);
+                        continue;
+                    }
                 }
+                else {
+                    // Legacy Protocol (v0) message handling
+                    if (line == protocol::CMD_QUIT) {
+                        userRequestedQuit = true;
+                        shouldExit = true;
+                        break;
+                    }
 
-                // Suppress empty chat lines
-                if (line.empty()) {
-                    continue;
+                    // Suppress empty chat lines
+                    if (line.empty()) {
+                        continue;
+                    }
+
+                    std::string msgId = "msg-" + std::to_string(++m_messageSequence);
+                    int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+
+                    // Log received normal chat message as a CHAT event
+                    m_logger.chat("[" + registeredUsername + "]: " + line);
+
+                    // Broadcast chat message to all other connected clients
+                    std::string legacyBroadcast = "[" + registeredUsername + "]: " + line;
+                    auto structBroadcast = protocol::StructuredMessage::createMsgBroadcast(
+                        registeredUsername, line, msgId, nowSec);
+                    m_clientManager.broadcastStructured(structBroadcast, legacyBroadcast, clientSocket);
                 }
-
-                // Log received normal chat message as a CHAT event
-                m_logger.chat("[" + registeredUsername + "]: " + line);
-
-                // Broadcast chat message to all other connected clients
-                std::string chatMessage = "[" + registeredUsername + "]: " + line + protocol::DELIMITER;
-                m_clientManager.broadcastMessage(chatMessage, clientSocket);
             }
 
             if (shouldExit) {
@@ -277,8 +470,12 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
             }
 
             // Broadcast leave notification to all remaining connected clients
-            std::string leaveNotification = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat." + protocol::DELIMITER;
-            m_clientManager.broadcastMessage(leaveNotification, clientSocket);
+            int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::string legacyLeave = std::string(protocol::PREFIX_SYSTEM) + " " + departingUser + " has left the chat.";
+            auto structLeave = protocol::StructuredMessage::createSystemEvent(
+                protocol::EVENT_LEAVE, departingUser, legacyLeave, nowSec);
+            m_clientManager.broadcastStructured(structLeave, legacyLeave, clientSocket);
         }
     }
 

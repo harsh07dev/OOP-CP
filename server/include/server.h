@@ -70,4 +70,7 @@ private:
     // Thread tracking to ensure coordinated shutdown and zero detached threads
     std::mutex m_threadsMutex;
     std::vector<WorkerRecord> m_workers;
+
+    // Monotonic message sequence counter for structured message identification
+    std::atomic<uint64_t> m_messageSequence{0};
 };

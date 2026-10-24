@@ -56,7 +56,7 @@ bool ClientManager::isUsernameTaken(const std::string& username) const {
     return false;
 }
 
-RegistrationResult ClientManager::registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed) {
+RegistrationResult ClientManager::registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed, protocol::ProtocolVersion protocolVersion) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     // 1. Verify socket is not already registered
@@ -83,6 +83,7 @@ RegistrationResult ClientManager::registerClient(SOCKET socket, const std::strin
     info.socket = socket;
     info.username = username;
     info.address = address;
+    info.protocolVersion = protocolVersion;
     if (isClosed) {
         info.isClosed = isClosed;
     }
@@ -161,6 +162,18 @@ bool ClientManager::getClientInfo(SOCKET socket, ClientInfo& outInfo) const {
     return false;
 }
 
+bool ClientManager::getClientProtocolVersion(SOCKET socket, protocol::ProtocolVersion& outVersion) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    for (const auto& client : m_clients) {
+        if (client.socket == socket) {
+            outVersion = client.protocolVersion;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<ClientInfo> ClientManager::getAllClients() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_clients;
@@ -206,6 +219,64 @@ void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSo
     }
 
     // Evict any dead sockets that failed during broadcast
+    if (!deadSockets.empty()) {
+        for (SOCKET s : deadSockets) {
+            removeClient(s);
+        }
+    }
+}
+
+void ClientManager::broadcastStructured(const protocol::StructuredMessage& structuredMsg, const std::string& legacyText, SOCKET senderSocket) {
+    std::vector<ClientInfo> targets;
+    Logger* logger = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        logger = m_logger;
+        targets.reserve(m_clients.size());
+        for (const auto& client : m_clients) {
+            if (client.socket != senderSocket) {
+                targets.push_back(client);
+            }
+        }
+    }
+
+    protocol::StructuredMessage boundedMsg = structuredMsg;
+    if (boundedMsg.serializeWire().size() > protocol::MAX_MESSAGE_SIZE) {
+        boundedMsg.truncateToFitWire(protocol::MAX_MESSAGE_SIZE);
+    }
+    std::string structuredWire = boundedMsg.serializeWire();
+
+    std::string legacyWire = legacyText;
+    if (legacyWire.empty() || legacyWire.back() != protocol::DELIMITER) {
+        legacyWire += protocol::DELIMITER;
+    }
+
+    std::vector<SOCKET> deadSockets;
+
+    for (const auto& target : targets) {
+        if (!target.sendMutex || !target.isClosed) {
+            continue;
+        }
+
+        std::lock_guard<std::mutex> sendLock(*target.sendMutex);
+        if (target.isClosed->load()) {
+            continue;
+        }
+
+        const std::string& dataToSend = (target.protocolVersion == protocol::ProtocolVersion::STRUCTURED_V1)
+                                        ? structuredWire : legacyWire;
+
+        bool success = sendAll(target.socket, dataToSend, target.username, logger);
+        if (!success) {
+            if (!target.isClosed->exchange(true)) {
+                netShutdownSocket(target.socket, NET_SHUTDOWN_RDWR);
+                netCloseSocket(target.socket);
+            }
+            deadSockets.push_back(target.socket);
+        }
+    }
+
     if (!deadSockets.empty()) {
         for (SOCKET s : deadSockets) {
             removeClient(s);
