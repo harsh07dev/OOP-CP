@@ -3041,6 +3041,19 @@ def run_all_tests():
         else:
             failures.append(f"/history room (header={room_history_header!r}, item={room_history_item!r})")
 
+        # Rejected outbound messages must not be echoed as if they were sent.
+        send_line(bob_proc, "/leave lobby56")
+        bob_reader.read_until("Left 'lobby56'", timeout=3.0)
+        send_line(bob_proc, "/room lobby56 should not echo")
+        room_error_line, room_error_lines = bob_reader.read_until("ERR_NOT_IN_ROOM", timeout=3.0)
+        false_room_echo = any("[You @lobby56] should not echo" in line for line in room_error_lines)
+        if room_error_line and not false_room_echo:
+            passed.append("rejected room message is not echoed")
+        else:
+            failures.append(
+                f"rejected room echo (error={room_error_line!r}, echoed={false_room_echo})"
+            )
+
         send_line(alice_proc, "/history public")
         public_history_header, _ = alice_reader.read_until("History: public", timeout=3.0)
         public_history_item, _ = alice_reader.read_until("hello bob", timeout=3.0)

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 class ChatSession {
 public:
@@ -51,6 +52,18 @@ public:
     void notifyInputConsumed();
 
 private:
+    enum class EchoKind {
+        Public,
+        Direct,
+        Room
+    };
+
+    struct PendingEcho {
+        EchoKind kind{EchoKind::Public};
+        std::string target;
+        std::string content;
+    };
+
     Client& client_;
     std::string username_;
     std::atomic<bool> running_{false};
@@ -58,11 +71,18 @@ private:
     std::atomic<std::uint64_t> requestCounter_{0};
     std::mutex outputMutex_;
     bool promptVisible_{false};
+    std::mutex pendingMutex_;
+    std::unordered_map<std::string, PendingEcho> pendingEchoes_;
 
     std::string nextRequestId(const char* prefix);
     bool sendStructured(const protocol::StructuredMessage& message, bool reportError = true);
     void dispatchServerMessage(const protocol::StructuredMessage& message);
     void printHelp();
+
+    void rememberPending(const std::string& id, EchoKind kind,
+                         const std::string& target, const std::string& content);
+    bool takePending(const std::string& id, EchoKind expected, PendingEcho& out);
+    void discardPending(const std::string& id);
 
     static std::string formatTimestamp(std::int64_t timestamp);
     static bool parsePositiveInt(const std::string& text, int& value);

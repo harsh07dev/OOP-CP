@@ -150,10 +150,11 @@ bool ChatSession::handleCommand(const std::string& line) {
 
     // Plain text is a public chat message.
     if (trimmed.front() != '/') {
-        auto message = protocol::StructuredMessage::createMsgSend(
-            trimmed, nextRequestId("msg"));
-        if (sendStructured(message)) {
-            printPlain("[You] " + trimmed);
+        const std::string requestId = nextRequestId("msg");
+        auto message = protocol::StructuredMessage::createMsgSend(trimmed, requestId);
+        rememberPending(requestId, EchoKind::Public, "", trimmed);
+        if (!sendStructured(message)) {
+            discardPending(requestId);
         }
         return true;
     }
@@ -219,8 +220,10 @@ bool ChatSession::handleCommand(const std::string& line) {
         }
         auto request = protocol::StructuredMessage::createMsgDirectReq(
             recipient, content, nextRequestId("dm"));
-        if (sendStructured(request)) {
-            printPlain("[DM to " + recipient + "] " + content);
+        const std::string requestId = request.id;
+        rememberPending(requestId, EchoKind::Direct, recipient, content);
+        if (!sendStructured(request)) {
+            discardPending(requestId);
         }
         return true;
     }
@@ -289,8 +292,10 @@ bool ChatSession::handleCommand(const std::string& line) {
         }
         auto request = protocol::StructuredMessage::createRoomMsgReq(
             room, content, nextRequestId("rmsg"));
-        if (sendStructured(request)) {
-            printPlain("[You @" + room + "] " + content);
+        const std::string requestId = request.id;
+        rememberPending(requestId, EchoKind::Room, room, content);
+        if (!sendStructured(request)) {
+            discardPending(requestId);
         }
         return true;
     }
@@ -381,11 +386,21 @@ void ChatSession::dispatchServerMessage(const protocol::StructuredMessage& messa
         printIncoming("[" + message.from + "] " + message.content);
     } else if (message.type == protocol::TYPE_MSG_DIRECT) {
         printIncoming("[DM from " + message.from + "] " + message.content);
-    } else if (message.type == protocol::TYPE_MSG_ACK ||
-               message.type == protocol::TYPE_MSG_DIRECT_ACK ||
-               message.type == protocol::TYPE_ROOM_MSG_ACK) {
-        // Acknowledgements are intentionally quiet; the client already echoes
-        // the outbound message locally.
+    } else if (message.type == protocol::TYPE_MSG_ACK) {
+        PendingEcho pending;
+        if (takePending(message.id, EchoKind::Public, pending)) {
+            printIncoming("[You] " + pending.content);
+        }
+    } else if (message.type == protocol::TYPE_MSG_DIRECT_ACK) {
+        PendingEcho pending;
+        if (takePending(message.id, EchoKind::Direct, pending)) {
+            printIncoming("[DM to " + pending.target + "] " + pending.content);
+        }
+    } else if (message.type == protocol::TYPE_ROOM_MSG_ACK) {
+        PendingEcho pending;
+        if (takePending(message.id, EchoKind::Room, pending)) {
+            printIncoming("[You @" + pending.target + "] " + pending.content);
+        }
     } else if (message.type == protocol::TYPE_SYSTEM_EVENT ||
                message.type == protocol::TYPE_USER_JOINED ||
                message.type == protocol::TYPE_USER_LEFT) {
@@ -491,6 +506,7 @@ void ChatSession::dispatchServerMessage(const protocol::StructuredMessage& messa
         }
         printIncoming(output);
     } else if (message.type == protocol::TYPE_ERROR) {
+        discardPending(message.id);
         printIncoming("[Error] " + message.code +
                       (message.detail.empty() ? "" : ": " + message.detail));
     } else if (!message.content.empty()) {
@@ -540,6 +556,28 @@ bool ChatSession::sendStructured(const protocol::StructuredMessage& message, boo
         return false;
     }
     return true;
+}
+
+void ChatSession::rememberPending(const std::string& id, EchoKind kind,
+                                  const std::string& target, const std::string& content) {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pendingEchoes_[id] = PendingEcho{kind, target, content};
+}
+
+bool ChatSession::takePending(const std::string& id, EchoKind expected, PendingEcho& out) {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    auto it = pendingEchoes_.find(id);
+    if (it == pendingEchoes_.end() || it->second.kind != expected) {
+        return false;
+    }
+    out = it->second;
+    pendingEchoes_.erase(it);
+    return true;
+}
+
+void ChatSession::discardPending(const std::string& id) {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pendingEchoes_.erase(id);
 }
 
 void ChatSession::printPrompt() {
