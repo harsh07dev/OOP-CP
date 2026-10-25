@@ -5,6 +5,8 @@ for the C++ TCP Multi-Client Chat Application.
 
 ## Current documentation
 
+- [Interactive quickstart and demo](../docs.html): Build/run steps, an animated
+  two-client transcript, and the console command reference.
 - [Protocol Specification](PROTOCOL_SPECIFICATION.md): Complete Structured
   Protocol v1 schema, legacy v0 compatibility, validation rules, error codes,
   private messaging, rooms, and persistent history.

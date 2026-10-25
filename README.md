@@ -5,6 +5,8 @@ server supports multiple concurrent clients, public chat, private messages,
 ephemeral chat rooms, SQLite-backed message history, and both a structured
 JSON protocol (v1) and the original newline-delimited legacy protocol (v0).
 
+[Quick start and animated demo](docs.html) · [Build instructions](#build) · [Protocol specification](docs/PROTOCOL_SPECIFICATION.md)
+
 ## Features
 
 ### Core chat
