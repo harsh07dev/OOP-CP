@@ -1,15 +1,18 @@
 // sender.cpp - Implementation of the sender worker.
-// Continuously reads console input lines, serializes messages via protocol, and sends them to the server.
+// Waits for console input with a short timeout so server disconnects can stop
+// the client promptly, then delegates command handling to ChatSession.
 
 #include "sender.h"
+#include "chat_session.h"
 #include "client.h"
-#include "protocol_handler.h"
-#include "protocol.h"
+#include "console_input.h"
 
 #include <iostream>
+#include <string>
 
-Sender::Sender(Client& client)
+Sender::Sender(Client& client, ChatSession& session)
     : client_(client),
+      session_(session),
       is_running_(false) {
 }
 
@@ -19,36 +22,30 @@ Sender::~Sender() {
 
 void Sender::start() {
     is_running_ = true;
-    std::string line;
 
-    while (is_running_ && client_.is_connected()) {
-        std::cout << "> " << std::flush;
+    while (is_running_ && session_.isRunning() && client_.is_connected()) {
+        session_.printPrompt();
 
-        if (!std::getline(std::cin, line)) {
-            // EOF or console stream closed
-            break;
-        }
-
-        if (!is_running_ || !client_.is_connected()) {
-            break;
-        }
-
-        // Handle /quit command
-        if (line == protocol::CMD_QUIT) {
-            std::cout << "\n[Notice] Disconnecting from server..." << std::endl;
-            client_.send_raw(ProtocolHandler::format_leave());
-            client_.disconnect();
-            break;
-        }
-
-        // Send non-empty message formatted via protocol
-        if (!line.empty()) {
-            std::string payload = ProtocolHandler::format_chat(line);
-            if (!client_.send_raw(payload)) {
-                std::cerr << "\n[Error] Failed to send message: connection lost." << std::endl;
-                client_.disconnect();
-                break;
+        // Wait for a line without blocking forever.  This lets the sender
+        // notice a server-side disconnect even while the user is idle.
+        while (is_running_ && session_.isRunning() && client_.is_connected()) {
+            if (!console_input::is_readable(200)) {
+                continue;
             }
+
+            std::string line;
+            if (!std::getline(std::cin, line)) {
+                session_.stop();
+                is_running_ = false;
+                return;
+            }
+
+            session_.notifyInputConsumed();
+            if (!session_.handleCommand(line)) {
+                is_running_ = false;
+                return;
+            }
+            break;
         }
     }
 

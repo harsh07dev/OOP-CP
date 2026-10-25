@@ -275,20 +275,27 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             break;
                         }
 
-                        // Registration succeeded
+                        // Registration succeeded (pending activation)
                         isRegistered = true;
                         registeredUsername = username;
                         m_clientManager.getClientInfo(clientSocket, myClientInfo);
-                        m_logger.info("User registered (Structured v1): " + registeredUsername + " (" + clientEndpoint + ")");
-                        m_logger.info("User joined: " + registeredUsername);
 
-                        // Send register_ack
+                        // Send register_ack before the client becomes visible to broadcasts
                         auto ack = protocol::StructuredMessage::createRegisterAck(registeredUsername, reqMsg.id);
                         if (!ClientManager::sendAll(clientSocket, ack.serializeWire(), registeredUsername, &m_logger)) {
                             m_logger.error("Failed to send register_ack to " + registeredUsername);
                             shouldExit = true;
                             break;
                         }
+
+                        if (!m_clientManager.activateClient(clientSocket)) {
+                            m_logger.error("Failed to activate structured client " + registeredUsername);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        m_logger.info("User registered (Structured v1): " + registeredUsername + " (" + clientEndpoint + ")");
+                        m_logger.info("User joined: " + registeredUsername);
 
                         // Broadcast join notification to all other clients
                         int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(
@@ -327,12 +334,10 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             break;
                         }
 
-                        // Registration succeeded
+                        // Registration succeeded (pending activation)
                         isRegistered = true;
                         registeredUsername = line;
                         m_clientManager.getClientInfo(clientSocket, myClientInfo);
-                        m_logger.info("User registered (Legacy v0): " + registeredUsername + " (" + clientEndpoint + ")");
-                        m_logger.info("User joined: " + registeredUsername);
 
                         // Send OK acknowledgement directly to the registering client
                         std::string okResp = std::string(protocol::RESP_OK) + protocol::DELIMITER;
@@ -341,6 +346,15 @@ void Server::handleClient(SOCKET clientSocket, sockaddr_in clientAddr, std::shar
                             shouldExit = true;
                             break;
                         }
+
+                        if (!m_clientManager.activateClient(clientSocket)) {
+                            m_logger.error("Failed to activate legacy client " + registeredUsername);
+                            shouldExit = true;
+                            break;
+                        }
+
+                        m_logger.info("User registered (Legacy v0): " + registeredUsername + " (" + clientEndpoint + ")");
+                        m_logger.info("User joined: " + registeredUsername);
 
                         // Broadcast join notification to all other connected clients
                         int64_t nowSec = std::chrono::duration_cast<std::chrono::seconds>(

@@ -16,6 +16,11 @@ find_package(Threads REQUIRED)
 
 # SQLite3 library for persistence
 find_package(SQLite3 REQUIRED)
+if(TARGET SQLite3::SQLite3)
+    set(SQLITE_TARGET SQLite3::SQLite3)
+else()
+    set(SQLITE_TARGET SQLite::SQLite3)
+endif()
 
 # Platform-specific socket libraries
 if(WIN32)
@@ -37,12 +42,13 @@ add_executable(chat_server
     server/src/logger.cpp
 )
 target_include_directories(chat_server PRIVATE server/include common/include)
-target_link_libraries(chat_server PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS} SQLite::SQLite3)
+target_link_libraries(chat_server PRIVATE Threads::Threads ${PLATFORM_NETWORK_LIBS} ${SQLITE_TARGET})
 
 # Client executable target
 add_executable(chat_client
     client/src/main.cpp
     client/src/client.cpp
+    client/src/chat_session.cpp
     client/src/sender.cpp
     client/src/receiver.cpp
 )

@@ -6,6 +6,7 @@ import os
 import struct
 import threading
 import json
+import queue
 
 def find_executable(name):
     env_var = name.upper() + "_BIN"
@@ -130,6 +131,52 @@ def stop_server(p):
             p.kill()
             p.wait()
 
+def find_free_port():
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind((HOST, 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+class ProcessLineReader:
+    """Non-blocking line reader for an interactive subprocess (cross-platform)."""
+    def __init__(self, process):
+        self.process = process
+        self.lines = queue.Queue()
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        try:
+            for line in self.process.stdout:
+                self.lines.put(line.rstrip("\r\n"))
+        except Exception:
+            pass
+
+    def read_until(self, needle, timeout=5.0):
+        collected = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.05, deadline - time.time())
+            try:
+                line = self.lines.get(timeout=remaining)
+            except queue.Empty:
+                break
+            collected.append(line)
+            if needle in line:
+                return line, collected
+        return None, collected
+
+    def drain(self, duration=0.2):
+        collected = []
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            try:
+                collected.append(self.lines.get(timeout=max(0.01, deadline - time.time())))
+            except queue.Empty:
+                break
+        return collected
+
 def run_all_tests():
     global SERVER_EXE, CLIENT_EXE
     results = {}
@@ -162,7 +209,8 @@ def run_all_tests():
 
         client_cmd = [
             "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Icommon/include", "-Iclient/include",
-            "client/src/main.cpp", "client/src/client.cpp", "client/src/sender.cpp", "client/src/receiver.cpp"
+            "client/src/main.cpp", "client/src/client.cpp", "client/src/chat_session.cpp",
+            "client/src/sender.cpp", "client/src/receiver.cpp"
         ]
         if sys.platform == "win32":
             client_cmd += ["-lws2_32", "-o", "chat_client.exe"]
@@ -2885,6 +2933,191 @@ def run_all_tests():
     finally:
         stop_server(srv_struct)
         cleanup_db(TEST_DB)
+
+    # Test 56: Interactive console client commands and advanced features
+    print("\n--- Test 56: Interactive console client commands ---")
+    client_server = None
+    client_processes = []
+    client_db = os.path.abspath(f"test_client_commands_{os.getpid()}.db")
+    try:
+        client_port = find_free_port()
+        cleanup_db(client_db)
+        client_server = start_server(client_port, client_db)
+
+        def launch_client(name):
+            process = subprocess.Popen(
+                [CLIENT_EXE],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            process.stdin.write(f"127.0.0.1\n{client_port}\n{name}\n")
+            process.stdin.flush()
+            reader = ProcessLineReader(process)
+            client_processes.append(process)
+            return process, reader
+
+        def send_line(process, text):
+            process.stdin.write(text + "\n")
+            process.stdin.flush()
+
+        alice_proc, alice_reader = launch_client("CliAlice")
+        _, alice_collected = alice_reader.read_until("Registration successful! Welcome, CliAlice.", timeout=5.0)
+
+        bob_proc, bob_reader = launch_client("CliBob")
+        _, bob_collected = bob_reader.read_until("Registration successful! Welcome, CliBob.", timeout=5.0)
+        alice_reader.read_until("CliBob has joined the chat.", timeout=3.0)
+
+        failures = []
+        passed = []
+
+        # Public chat rendered by both the sender and the peer
+        send_line(alice_proc, "hello bob")
+        alice_echo, _ = alice_reader.read_until("[You] hello bob", timeout=3.0)
+        bob_received, _ = bob_reader.read_until("[CliAlice] hello bob", timeout=3.0)
+        if alice_echo and bob_received:
+            passed.append("public chat sender echo + peer broadcast")
+        else:
+            failures.append(f"public chat (echo={alice_echo!r}, peer={bob_received!r})")
+
+        # Online user list
+        send_line(alice_proc, "/users")
+        users_header, _ = alice_reader.read_until("Online users", timeout=3.0)
+        users_bob, _ = alice_reader.read_until("CliBob", timeout=3.0)
+        if users_header and users_bob:
+            passed.append("online user list")
+        else:
+            failures.append(f"/users (header={users_header!r}, bob={users_bob!r})")
+
+        # Direct messaging and direct history
+        send_line(alice_proc, "/msg CliBob private hello")
+        dm_echo, _ = alice_reader.read_until("[DM to CliBob] private hello", timeout=3.0)
+        dm_received, _ = bob_reader.read_until("[DM from CliAlice] private hello", timeout=3.0)
+        if dm_echo and dm_received:
+            passed.append("private message delivery")
+        else:
+            failures.append(f"private message (echo={dm_echo!r}, received={dm_received!r})")
+
+        send_line(alice_proc, "/history dm CliBob")
+        dm_history_header, _ = alice_reader.read_until("History: direct with CliBob", timeout=3.0)
+        dm_history_item, _ = alice_reader.read_until("private hello", timeout=3.0)
+        if dm_history_header and dm_history_item:
+            passed.append("direct-message history")
+        else:
+            failures.append(f"/history dm (header={dm_history_header!r}, item={dm_history_item!r})")
+
+        # Room creation, join, message, member list, and room history
+        send_line(alice_proc, "/create lobby56")
+        room_created, _ = alice_reader.read_until("Created room 'lobby56'", timeout=3.0)
+        send_line(bob_proc, "/join lobby56")
+        room_joined, _ = bob_reader.read_until("Joined 'lobby56'", timeout=3.0)
+        alice_reader.read_until("CliBob has joined lobby56", timeout=3.0)
+        send_line(alice_proc, "/room lobby56 room hello")
+        room_echo, _ = alice_reader.read_until("[You @lobby56] room hello", timeout=3.0)
+        room_received, _ = bob_reader.read_until("[lobby56] CliAlice: room hello", timeout=3.0)
+        if room_created and room_joined and room_echo and room_received:
+            passed.append("room create/join/message")
+        else:
+            failures.append(
+                f"room flow (created={room_created!r}, joined={room_joined!r}, "
+                f"echo={room_echo!r}, received={room_received!r})"
+            )
+
+        send_line(alice_proc, "/members lobby56")
+        members_header, _ = alice_reader.read_until("Members of 'lobby56'", timeout=3.0)
+        members_bob, _ = alice_reader.read_until("CliBob", timeout=3.0)
+        if members_header and members_bob:
+            passed.append("room member list")
+        else:
+            failures.append(f"/members (header={members_header!r}, bob={members_bob!r})")
+
+        send_line(bob_proc, "/history room lobby56")
+        room_history_header, _ = bob_reader.read_until("History: room 'lobby56'", timeout=3.0)
+        room_history_item, _ = bob_reader.read_until("room hello", timeout=3.0)
+        if room_history_header and room_history_item:
+            passed.append("room history")
+        else:
+            failures.append(f"/history room (header={room_history_header!r}, item={room_history_item!r})")
+
+        send_line(alice_proc, "/history public")
+        public_history_header, _ = alice_reader.read_until("History: public", timeout=3.0)
+        public_history_item, _ = alice_reader.read_until("hello bob", timeout=3.0)
+        if public_history_header and public_history_item:
+            passed.append("public history")
+        else:
+            failures.append(f"/history public (header={public_history_header!r}, item={public_history_item!r})")
+
+        send_line(alice_proc, "/help")
+        help_line, _ = alice_reader.read_until("Available commands", timeout=3.0)
+        if help_line:
+            passed.append("/help")
+        else:
+            failures.append("/help")
+
+        # Duplicate username rejection followed by a successful retry
+        duplicate_proc, duplicate_reader = launch_client("CliAlice")
+        duplicate_error, _ = duplicate_reader.read_until("already taken", timeout=5.0)
+        send_line(duplicate_proc, "CliDuplicate")
+        duplicate_retry, _ = duplicate_reader.read_until(
+            "Registration successful! Welcome, CliDuplicate.", timeout=5.0)
+        send_line(duplicate_proc, "/quit")
+        try:
+            duplicate_proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            duplicate_proc.kill()
+        if duplicate_error and duplicate_retry:
+            passed.append("duplicate username retry")
+        else:
+            failures.append(
+                f"duplicate username retry (error={duplicate_error!r}, retry={duplicate_retry!r})"
+            )
+
+        # Graceful client exit
+        send_line(alice_proc, "/quit")
+        disconnect_line, _ = alice_reader.read_until("Disconnected from server.", timeout=4.0)
+        try:
+            alice_proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            alice_proc.kill()
+        send_line(bob_proc, "/quit")
+        try:
+            bob_proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            bob_proc.kill()
+
+        if disconnect_line and alice_proc.returncode == 0 and bob_proc.returncode == 0:
+            passed.append("graceful /quit")
+        else:
+            failures.append(
+                f"graceful /quit (line={disconnect_line!r}, "
+                f"alice_rc={alice_proc.returncode}, bob_rc={bob_proc.returncode})"
+            )
+
+        if not failures:
+            results["Test 56: Interactive client commands and advanced features"] = "Passed"
+            print(f"Test 56 PASSED: {'; '.join(passed)}")
+        else:
+            results["Test 56: Interactive client commands and advanced features"] = f"Failed ({'; '.join(failures)})"
+            print(f"Test 56 FAILED: {'; '.join(failures)}")
+    except Exception as e:
+        results["Test 56: Interactive client commands and advanced features"] = f"Failed ({e})"
+        print("Test 56 FAILED with exception:", e)
+    finally:
+        for process in client_processes:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+        if client_server is not None:
+            stop_server(client_server)
+        cleanup_db(client_db)
 
     print("\n================ FINAL TEST SUMMARY ================")
     all_passed = True

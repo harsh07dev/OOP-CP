@@ -94,8 +94,22 @@ RegistrationResult ClientManager::registerClient(SOCKET socket, const std::strin
     return RegistrationResult::SUCCESS;
 }
 
+bool ClientManager::activateClient(SOCKET socket) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& client : m_clients) {
+        if (client.socket == socket) {
+            client.isActive = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ClientManager::addClient(SOCKET socket, const std::string& username, const sockaddr_in& address) {
-    return registerClient(socket, username, address) == RegistrationResult::SUCCESS;
+    if (registerClient(socket, username, address) != RegistrationResult::SUCCESS) {
+        return false;
+    }
+    return activateClient(socket);
 }
 
 bool ClientManager::removeClient(SOCKET socket) {
@@ -147,7 +161,13 @@ void ClientManager::closeAllClients() {
 
 size_t ClientManager::getClientCount() const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_clients.size();
+    size_t count = 0;
+    for (const auto& client : m_clients) {
+        if (client.isActive) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 bool ClientManager::getClientInfo(SOCKET socket, ClientInfo& outInfo) const {
@@ -184,7 +204,9 @@ std::vector<std::string> ClientManager::getOnlineUsernames() const {
     std::vector<std::string> usernames;
     usernames.reserve(m_clients.size());
     for (const auto& client : m_clients) {
-        usernames.push_back(client.username);
+        if (client.isActive) {
+            usernames.push_back(client.username);
+        }
     }
     return usernames;
 }
@@ -192,7 +214,7 @@ std::vector<std::string> ClientManager::getOnlineUsernames() const {
 bool ClientManager::getClientByUsername(const std::string& username, ClientInfo& outInfo) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto& client : m_clients) {
-        if (equalsIgnoreCase(client.username, username)) {
+        if (client.isActive && equalsIgnoreCase(client.username, username)) {
             outInfo = client;
             return true;
         }
@@ -210,7 +232,7 @@ void ClientManager::broadcastMessage(const std::string& message, SOCKET senderSo
         logger = m_logger;
         targets.reserve(m_clients.size());
         for (const auto& client : m_clients) {
-            if (client.socket != senderSocket) {
+            if (client.isActive && client.socket != senderSocket) {
                 targets.push_back(client);
             }
         }
@@ -256,7 +278,7 @@ void ClientManager::broadcastStructured(const protocol::StructuredMessage& struc
         logger = m_logger;
         targets.reserve(m_clients.size());
         for (const auto& client : m_clients) {
-            if (client.socket != senderSocket) {
+            if (client.isActive && client.socket != senderSocket) {
                 targets.push_back(client);
             }
         }

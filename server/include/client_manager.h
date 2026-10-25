@@ -22,6 +22,10 @@ struct ClientInfo {
     std::shared_ptr<std::mutex> sendMutex{std::make_shared<std::mutex>()};
     std::shared_ptr<std::atomic<bool>> isClosed{std::make_shared<std::atomic<bool>>(false)};
     protocol::ProtocolVersion protocolVersion{protocol::ProtocolVersion::LEGACY_V0};
+    // A client is inserted into the registry in a pending state so that the
+    // registration ACK is always the first frame it receives.  It is activated
+    // only after the ACK has been written successfully.
+    bool isActive{false};
 };
 
 enum class RegistrationResult {
@@ -45,8 +49,13 @@ public:
     // Configure logger reference for broadcast error reporting
     void setLogger(Logger* logger);
 
-    // Thread-safe atomic validation, duplicate check (case-insensitive), and registration
+    // Thread-safe atomic validation, duplicate check (case-insensitive), and registration.
+    // The client starts in a pending (inactive) state and must be activated with
+    // activateClient() after its registration ACK has been sent.
     RegistrationResult registerClient(SOCKET socket, const std::string& username, const sockaddr_in& address, std::shared_ptr<std::atomic<bool>> isClosed = nullptr, protocol::ProtocolVersion protocolVersion = protocol::ProtocolVersion::LEGACY_V0);
+
+    // Thread-safe activation of a pending client after its registration ACK was sent.
+    bool activateClient(SOCKET socket);
 
     // Thread-safe check if a username is currently taken (case-insensitive)
     bool isUsernameTaken(const std::string& username) const;

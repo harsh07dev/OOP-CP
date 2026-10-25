@@ -13,6 +13,7 @@
 #include <string_view>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace protocol {
 

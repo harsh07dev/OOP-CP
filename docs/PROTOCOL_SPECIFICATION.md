@@ -1,7 +1,7 @@
 # Protocol Specification & Compatibility Audit (Phase 4 — Task 4)
 
 **Document:** `docs/PROTOCOL_SPECIFICATION.md`  
-**Status:** Implemented and Tested (55/55 Regression Scenarios Passing)  
+**Status:** Implemented and Tested (56/56 Regression Scenarios Passing)
 **Applicability:** C++17 Multi-Client TCP Chat Architecture  
 
 ---
@@ -523,12 +523,16 @@ Fields:
    - Independent mutex hierarchy: `RoomManager` never acquires `ClientManager` locks and vice versa.
 7. **[server/src/server.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/server/src/server.cpp)**:
    - Handshake detection, registration enforcement, monotonic message sequencing, private routing, room operations, history pagination, and clean disconnect teardown.
+8. **[client/include/chat_session.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/client/include/chat_session.h) & [client/src/chat_session.cpp](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/client/src/chat_session.cpp)**:
+   - Structured registration handshake, console command parsing, request correlation IDs, and human-readable rendering of all server event types.
+9. **[client/include/console_input.h](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/client/include/console_input.h)**:
+   - Cross-platform non-blocking stdin readiness check so the sender can exit promptly when the server disconnects.
 
 ---
 
-## 7. Test Results (55/55 Passing)
+## 7. Test Results (56/56 Passing)
 
-The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes legacy tests, online users list tests, private messaging and room tests, and SQLite persistence history tests:
+The complete regression suite in [tests/regression_tests.py](file:///c:/Users/harsh/OneDrive/Desktop/OOP-CP/tests/regression_tests.py) executes legacy tests, online users list tests, private messaging and room tests, SQLite persistence history tests, and interactive console-client command tests:
 
 | Test ID | Test Name | Protocol Tested | Status |
 |---|---|---|---|
@@ -587,3 +591,4 @@ The complete regression suite in [tests/regression_tests.py](file:///c:/Users/ha
 | 53 | Storage failure handling and zero false ACK/broadcast | Structured v1 | **Passed** |
 | 54 | Concurrent public, direct, and room message storage integrity | Structured v1 | **Passed** |
 | 55 | Disconnect resilience (delivery failure after DB commit does not erase message) | Structured v1 | **Passed** |
+| 56 | Interactive console client commands (public chat, users, DMs, rooms, history, `/quit`) | Structured v1 | **Passed** |
