@@ -1,0 +1,29 @@
+{
+  "name": "tcp-chat-websocket-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket-to-TCP networking bridge for C++ TCP Multi-Client Chat System",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "tsx test/bridge.integration.test.ts"
+  },
+  "keywords": [
+    "chat",
+    "websocket",
+    "tcp",
+    "bridge"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
