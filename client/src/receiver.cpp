@@ -1,15 +1,16 @@
 // receiver.cpp - Implementation of the receiver worker.
-// Continuously receives incoming broadcast messages from the server socket and prints them to the console.
+// Reads complete newline-delimited frames and asks ChatSession to render them.
 
 #include "receiver.h"
+#include "chat_session.h"
 #include "client.h"
-#include "protocol_handler.h"
 
 #include <iostream>
+#include <string>
 
-Receiver::Receiver(Client& client)
+Receiver::Receiver(Client& client, ChatSession& session)
     : client_(client),
-      is_running_(false) {
+      session_(session) {
 }
 
 Receiver::~Receiver() {
@@ -20,25 +21,17 @@ void Receiver::start() {
     is_running_ = true;
     std::string line;
 
-    while (is_running_ && client_.is_connected()) {
+    while (is_running_ && session_.isRunning() && client_.is_connected()) {
         if (client_.receive_line(line)) {
-            // Parse incoming payload through the protocol handler
-            ClientMessage msg = ProtocolHandler::parse(line);
-
-            // Print incoming message cleanly and restore prompt
-            std::cout << "\r";
-            if (msg.category == MessageCategory::SYSTEM) {
-                std::cout << msg.text << "\n";
-            } else {
-                std::cout << msg.text << "\n";
-            }
-            std::cout << "> " << std::flush;
+            session_.handleServerLine(line);
         } else {
-            // Connection closed or error occurred
-            if (is_running_) {
-                std::cout << "\n[Notice] Server disconnected. Press Enter to exit." << std::endl;
-                client_.disconnect();
+            if (is_running_ && session_.isRunning()) {
+                session_.stop();
+                session_.printIncoming("[Notice] Server disconnected.");
+            } else {
+                session_.stop();
             }
+            client_.disconnect();
             break;
         }
     }

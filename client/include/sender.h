@@ -2,16 +2,17 @@
 #define SENDER_H
 
 // sender.h - Declaration of user input sender functionality.
-// Reads user input from the console and forwards chat messages to the server; detects /quit command.
+// Reads console input without blocking indefinitely and forwards commands or
+// chat messages through the shared ChatSession.
 
 #include <atomic>
-#include <string>
 
 class Client;
+class ChatSession;
 
 class Sender {
 public:
-    explicit Sender(Client& client);
+    Sender(Client& client, ChatSession& session);
     ~Sender();
 
     // Disable copy semantics
@@ -24,6 +25,7 @@ public:
 
 private:
     Client& client_;
+    ChatSession& session_;
     std::atomic<bool> is_running_;
 };
 

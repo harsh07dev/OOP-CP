@@ -1,5 +1,10 @@
 # Project Progress Report & Phase 2 Readiness Assessment
 
+> **Historical document:** This report records the Phase 1/2 audit and the
+> Phase 3/4 implementation work as it happened. For the current feature list,
+> build instructions, and client command reference, see the repository
+> [`README.md`](../README.md).
+
 **Document Target:** `docs/PROJECT_PROGRESS_AND_PHASE2_READINESS.md`  
 **Project:** C++ TCP Socket Multi-Client Console Chat Application  
 **Current Branch:** `Server-side` (clean working tree, synced with `origin/Server-side`)  
@@ -1151,3 +1156,32 @@ All 55 integration and unit scenarios executed cleanly on Windows 11 with MinGW 
 - **Test 54**: High-concurrency public, direct, and room message storage integrity across 6 simultaneous threads.
 - **Test 55**: Disconnect resilience: delivery failure after database commit does not erase the message.
 
+---
+
+## 21. Phase 4 — Task 5: Interactive Structured Console Client
+
+### 21.1 Scope and Deliverables
+The console client was migrated from the legacy newline-only chat loop to the
+Structured Protocol v1 while preserving the original registration and `/quit`
+user experience.
+
+- The client now performs a `register_req` → `register_ack` handshake and
+  handles `ERR_USERNAME_TAKEN` / `ERR_INVALID_USERNAME` with retry support.
+- Public messages are sent as `msg_send`; incoming `msg_broadcast`,
+  `msg_direct`, `system_event`, `room_*`, `user_list_resp`, and `history_resp`
+  frames are rendered in a human-readable console format.
+- Added commands: `/help`, `/whoami`, `/status`, `/users`, `/msg` (`/dm`),
+  `/create`, `/join`, `/leave`, `/rooms`, `/members`, `/room` (`/rmsg`), and
+  `/history` with public/direct/room variants and `before`/`after` cursors.
+- Added a cross-platform non-blocking console-input helper so the sender can
+  observe server disconnects without requiring the user to press Enter.
+- Registration ACK ordering was hardened: clients are inserted into the
+  registry in a pending state and activated only after the ACK is sent, so a
+  concurrent join/leave event can never precede the handshake response.
+- Added interactive client regression coverage (`Test 56`) for public chat,
+  user listing, DMs, rooms, member listing, and public/direct/room history.
+
+### 21.2 Verification
+- Full regression suite: **56/56 passing**.
+- Verified on macOS (AppleClang 21) and documented for Windows/Linux builds.
+- Server and client compile cleanly under C++17 with `-Wall -Wextra`.

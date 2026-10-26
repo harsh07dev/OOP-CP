@@ -1,10 +1,11 @@
 // main.cpp - Entry point for the chat client application.
-// Prompts user for server IP, port, and username, connects to server, and starts sender/receiver threads.
+// Prompts for server IP, port, and username, performs the structured v1
+// registration handshake, then starts the sender and receiver workers.
 
 #include "client.h"
+#include "chat_session.h"
 #include "sender.h"
 #include "receiver.h"
-#include "protocol_handler.h"
 #include "protocol.h"
 #include "thread_compat.h"
 
@@ -36,13 +37,12 @@ int main() {
 
     Client client;
     client.set_server_info(ip_input, port);
+    ChatSession session(client);
 
     constexpr int MAX_REGISTRATION_ATTEMPTS = 5;
     bool registration_successful = false;
-    std::string registered_username;
 
     for (int attempt = 1; attempt <= MAX_REGISTRATION_ATTEMPTS; ++attempt) {
-        // Connect to server if not currently connected
         if (!client.is_connected()) {
             std::cout << "Connecting to server..." << std::endl;
             if (!client.connect_to_server()) {
@@ -52,7 +52,6 @@ int main() {
             std::cout << "Connected to server." << std::endl;
         }
 
-        // Prompt for username
         if (attempt == 1) {
             std::cout << "Username: ";
         } else {
@@ -66,54 +65,37 @@ int main() {
             return 0;
         }
 
-        client.set_username(username_input);
-
-        // Send username registration request
-        if (!client.send_raw(ProtocolHandler::format_join(username_input))) {
-            std::cerr << "[Error] Failed to send registration: connection lost." << std::endl;
-            client.disconnect();
-            return 1;
+        std::string detail;
+        ChatSession::RegistrationOutcome outcome = session.registerUser(username_input, detail);
+        if (outcome == ChatSession::RegistrationOutcome::Success) {
+            registration_successful = true;
+            std::cout << "Registration successful! Welcome, " << session.username() << "." << std::endl << std::endl;
+            break;
         }
 
-        // Wait for server's registration response line
-        std::string response;
-        if (!client.receive_line(response)) {
+        if (outcome == ChatSession::RegistrationOutcome::UsernameTaken) {
+            std::cerr << "[Error] Username '" << username_input
+                      << "' is already taken. Please choose another username." << std::endl;
+        } else if (outcome == ChatSession::RegistrationOutcome::InvalidUsername) {
+            std::cerr << "[Error] Username '" << username_input << "' is invalid." << std::endl;
+            std::cerr << "Rules: 1-" << protocol::MAX_USERNAME_LENGTH
+                      << " characters, alphanumeric (a-z, A-Z, 0-9), underscores (_), and hyphens (-) only." << std::endl;
+        } else if (outcome == ChatSession::RegistrationOutcome::ConnectionFailed) {
             std::cerr << "[Error] Server disconnected during registration." << std::endl;
             client.disconnect();
             return 1;
+        } else {
+            std::cerr << "[Error] Registration failed";
+            if (!detail.empty()) {
+                std::cerr << ": " << detail;
+            }
+            std::cerr << std::endl;
         }
 
-        // Process handshake response
-        if (response == protocol::RESP_OK) {
-            registration_successful = true;
-            registered_username = username_input;
-            std::cout << "Registration successful! Welcome, " << registered_username << "." << std::endl << std::endl;
-            break;
-        }
-        else if (response == protocol::RESP_ERR_USERNAME_TAKEN) {
-            std::cerr << "[Error] Username '" << username_input 
-                      << "' is already taken. Please choose another username." << std::endl;
-            client.disconnect();
-            if (attempt == MAX_REGISTRATION_ATTEMPTS) {
-                std::cerr << "[Error] Maximum registration attempts (" << MAX_REGISTRATION_ATTEMPTS 
-                          << ") reached. Exiting." << std::endl;
-                return 1;
-            }
-        }
-        else if (response == protocol::RESP_ERR_INVALID_USERNAME) {
-            std::cerr << "[Error] Username '" << username_input << "' is invalid." << std::endl;
-            std::cerr << "Rules: 1-" << protocol::MAX_USERNAME_LENGTH 
-                      << " characters, alphanumeric (a-z, A-Z, 0-9), underscores (_), and hyphens (-) only." << std::endl;
-            client.disconnect();
-            if (attempt == MAX_REGISTRATION_ATTEMPTS) {
-                std::cerr << "[Error] Maximum registration attempts (" << MAX_REGISTRATION_ATTEMPTS 
-                          << ") reached. Exiting." << std::endl;
-                return 1;
-            }
-        }
-        else {
-            std::cerr << "[Error] Unexpected server response during registration: " << response << std::endl;
-            client.disconnect();
+        client.disconnect();
+        if (attempt == MAX_REGISTRATION_ATTEMPTS) {
+            std::cerr << "[Error] Maximum registration attempts (" << MAX_REGISTRATION_ATTEMPTS
+                      << ") reached. Exiting." << std::endl;
             return 1;
         }
     }
@@ -123,12 +105,14 @@ int main() {
     }
 
     std::cout << "----------------------------------------" << std::endl;
-    std::cout << "Type your message below." << std::endl;
+    std::cout << "Type a message, or /help to see all commands." << std::endl;
     std::cout << "Use " << protocol::CMD_QUIT << " to exit." << std::endl;
     std::cout << "----------------------------------------" << std::endl << std::endl;
 
-    Receiver receiver(client);
-    Sender sender(client);
+    session.start();
+
+    Receiver receiver(client, session);
+    Sender sender(client, session);
 
     // Launch independent receiver thread
     ChatThread receiver_thread([&receiver]() {
@@ -145,11 +129,11 @@ int main() {
         sender_thread.join();
     }
 
-    // Stop receiver worker and disconnect client
+    // Stop both workers and close the socket, unblocking the receiver if needed.
+    session.stop();
     receiver.stop();
     client.disconnect();
 
-    // Wait for receiver thread to terminate
     if (receiver_thread.joinable()) {
         receiver_thread.join();
     }

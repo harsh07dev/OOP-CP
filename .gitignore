@@ -65,3 +65,10 @@ Thumbs.db
 # Logs (keep directory via .gitkeep, ignore runtime logs)
 logs/*.log
 !logs/.gitkeep
+
+# Runtime databases and locally built POSIX binaries
+*.db
+*.db-wal
+*.db-shm
+chat_server
+chat_client
