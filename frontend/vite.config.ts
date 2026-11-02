@@ -5,9 +5,13 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: true,       // Bind to 0.0.0.0 so LAN devices can connect (not just localhost)
     port: 5173,
+    strictPort: true, // Fail fast if 5173 is taken — avoids silent port changes
     proxy: {
-      // Proxy WebSocket connections from /ws to the bridge on 8081
+      // All browsers (local and remote) connect to ws://<host>:5173/ws.
+      // Vite proxies the WebSocket upgrade to the bridge on localhost:8081.
+      // This means only port 5173 needs to be open in the firewall — not 8081.
       '/ws': {
         target: 'ws://localhost:8081',
         ws: true,

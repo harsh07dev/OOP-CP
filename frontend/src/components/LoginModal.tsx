@@ -15,8 +15,11 @@ interface LoginModalProps {
 const USERNAME_PATTERN = /^[a-zA-Z0-9_-]{1,32}$/;
 
 export default function LoginModal({ status, error, onConnect }: LoginModalProps) {
+  // Use the Vite /ws proxy path — adapts to localhost or LAN IP automatically.
+  // Remote browsers load the page from ws://<LAN-IP>:5173, so this resolves
+  // to ws://<LAN-IP>:5173/ws which Vite proxies to the bridge on localhost:8081.
   const [bridgeUrl, setBridgeUrl] = useState(
-    `ws://${window.location.hostname}:8081`
+    `ws://${window.location.hostname}:${window.location.port || '5173'}/ws`
   );
   const [username, setUsername] = useState('');
   const [localError, setLocalError] = useState('');
@@ -115,7 +118,7 @@ export default function LoginModal({ status, error, onConnect }: LoginModalProps
           </button>
 
           <p className="text-xs text-secondary" style={{ textAlign: 'center', marginTop: 4 }}>
-            Requires C++ server on :8080 + bridge on :8081
+            C++ server :8080 · Bridge :8081 · Frontend :5173 (all on host laptop)
           </p>
         </div>
       </div>
