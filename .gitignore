@@ -72,3 +72,9 @@ logs/*.log
 *.db-shm
 chat_server
 chat_client
+
+# Node / Bridge
+node_modules/
+dist/
+third_party/
+
