@@ -1,14 +1,12 @@
 /**
- * LabView.tsx — System Lab: live stats, protocol inspector, raw frame sender.
+ * LabView.tsx — System Lab: real connection metrics, protocol workbench,
+ * and embedded Protocol Lens with privacy redaction.
  */
-import { useState, useEffect, useRef } from 'react';
-import type { ConnectionStatus, ChatMessage } from '../types';
 
-interface RawLogEntry {
-  ts: string;
-  dir: 'in' | 'out' | 'sys' | 'err';
-  text: string;
-}
+import { useState, useEffect } from 'react';
+import type { ConnectionStatus, ChatMessage, ProtocolFrame } from '../types';
+import ProtocolLens from './ProtocolLens';
+import { IcLab, IcSend } from './icons';
 
 interface LabViewProps {
   status: ConnectionStatus;
@@ -16,20 +14,25 @@ interface LabViewProps {
   onlineUsers: string[];
   joinedRooms: string[];
   messages: ChatMessage[];
+  protocolFrames: ProtocolFrame[];
+  connectedAt: Date | null;
+  inboundCount: number;
+  outboundCount: number;
+  inboundBytes: number;
+  outboundBytes: number;
   onRequestUsers: () => void;
   onRequestRooms: () => void;
   onRequestHistory: () => void;
   onClearMessages: () => void;
-  onSendRaw: (json: string) => void;
+  onClearFrames: () => void;
+  onSendRaw: (json: string) => boolean;
 }
-
-const nowStr = () => new Date().toLocaleTimeString([], { hour12: false });
 
 const STATUS_LABELS: Record<ConnectionStatus, string> = {
   disconnected: 'Disconnected',
   connecting:   'Connecting…',
-  connected:    'Connected',
-  error:        'Error',
+  connected:    'Connected (TCP/WS Active)',
+  error:        'Connection Error',
 };
 
 export default function LabView({
@@ -38,37 +41,39 @@ export default function LabView({
   onlineUsers,
   joinedRooms,
   messages,
+  protocolFrames,
+  connectedAt,
+  inboundCount,
+  outboundCount,
+  inboundBytes,
+  outboundBytes,
   onRequestUsers,
   onRequestRooms,
   onRequestHistory,
   onClearMessages,
+  onClearFrames,
   onSendRaw,
 }: LabViewProps) {
+  const [activeTab, setActiveTab] = useState<'metrics' | 'lens' | 'workbench'>('metrics');
   const [rawInput, setRawInput] = useState('');
   const [rawErr, setRawErr] = useState('');
-  const [log, setLog] = useState<RawLogEntry[]>([
-    { ts: nowStr(), dir: 'sys', text: 'System Lab ready. Protocol: v1 JSON over WebSocket via bridge.' },
-  ]);
-  const logRef = useRef<HTMLDivElement>(null);
+  const [lastSentStatus, setLastSentStatus] = useState<string | null>(null);
 
-  const appendLog = (dir: RawLogEntry['dir'], text: string) =>
-    setLog(prev => [...prev.slice(-300), { ts: nowStr(), dir, text }]);
-
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [log]);
+    if (!connectedAt) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [connectedAt]);
 
-  const prevLen = useRef(0);
-  useEffect(() => {
-    const newMsgs = messages.slice(prevLen.current);
-    prevLen.current = messages.length;
-    newMsgs.forEach(m => {
-      if (m.kind === 'error') appendLog('err', `[ERR] ${m.body}`);
-      else if (m.kind === 'system') appendLog('sys', m.body);
-      else if (m.own) appendLog('out', `→ ${m.kind}${m.room ? ' #'+m.room : m.target ? ' →'+m.target : ''}: ${m.body}`);
-      else appendLog('in', `← ${m.kind} [${m.sender}]: ${m.body}`);
-    });
-  }, [messages]);
+  const uptimeStr = (!connectedAt) ? '0s (Not connected)' : (() => {
+    const secs = Math.max(0, Math.floor((now - connectedAt.getTime()) / 1000));
+    const mins = Math.floor(secs / 60);
+    const hrs = Math.floor(mins / 60);
+    if (hrs > 0) return `${hrs}h ${mins % 60}m ${secs % 60}s`;
+    if (mins > 0) return `${mins}m ${secs % 60}s`;
+    return `${secs}s`;
+  })();
 
   const handleSendRaw = () => {
     const raw = rawInput.trim();
@@ -76,20 +81,32 @@ export default function LabView({
     try {
       JSON.parse(raw);
     } catch {
-      setRawErr('Invalid JSON — parse error');
+      setRawErr('Invalid JSON syntax — check quotes, commas, and braces.');
       return;
     }
     setRawErr('');
-    onSendRaw(raw);
-    appendLog('out', `RAW → ${raw}`);
-    setRawInput('');
+    const ok = onSendRaw(raw);
+    if (ok) {
+      setLastSentStatus(`Sent at ${new Date().toLocaleTimeString()} (${new TextEncoder().encode(raw).length + 1} wire bytes)`);
+      setRawInput('');
+    } else {
+      setRawErr('Failed to dispatch — socket closed or message oversized (>2048 bytes).');
+    }
+  };
+
+  const loadPreset = (preset: Record<string, unknown>) => {
+    setRawInput(JSON.stringify(preset, null, 2));
+    setRawErr('');
   };
 
   return (
     <div className="workspace">
       <div className="workspace__header">
         <div className="workspace__header-left">
-          <h2>System Lab</h2>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <IcLab size={18} />
+            <h2>System Lab & Diagnostics</h2>
+          </div>
           <span className={`conn-badge ${status}`}>
             <span className="conn-badge__dot" />
             {STATUS_LABELS[status]}
@@ -97,140 +114,218 @@ export default function LabView({
         </div>
       </div>
 
-      <div className="workspace__body" style={{ overflowY: 'auto', padding: '20px', display: 'flex', flexDirection: 'column', gap: 18 }}>
-        {/* Stats */}
-        <div className="grid-2">
-          <div className="stat-card">
-            <div className="stat-card__value">{onlineUsers.length}</div>
-            <div className="stat-card__label">Users Online</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-card__value">{joinedRooms.length}</div>
-            <div className="stat-card__label">Rooms Joined</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-card__value">{messages.length}</div>
-            <div className="stat-card__label">Messages (session)</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-card__value" style={{ fontSize: 15, fontWeight: 600 }}>
-              {username ?? '—'}
-            </div>
-            <div className="stat-card__label">Registered as</div>
-          </div>
-        </div>
-
-        {/* Quick commands */}
-        <div className="lab-section">
-          <div className="lab-section__header"><h3>Quick Commands</h3></div>
-          <div className="lab-section__body" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            <button id="lab-user-list" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestUsers}>
-              user_list_req
-            </button>
-            <button id="lab-room-list" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestRooms}>
-              room_list_req
-            </button>
-            <button id="lab-history" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestHistory}>
-              history_req (public)
-            </button>
-            <button
-              id="lab-clear"
-              className="btn btn-secondary"
-              style={{ fontSize: 12, color: 'var(--error)' }}
-              onClick={() => { onClearMessages(); appendLog('sys', 'Message buffer cleared'); }}
-            >
-              Clear Buffer
-            </button>
-          </div>
-        </div>
-
-        {/* Raw frame sender */}
-        <div className="lab-section">
-          <div className="lab-section__header"><h3>Send Raw Frame (Ctrl+Enter)</h3></div>
-          <div className="lab-section__body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <p className="text-xs text-secondary">
-              Sends a raw JSON v1 frame via the bridge to the C++ server. Must be valid JSON.
-            </p>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <textarea
-                id="raw-frame-input"
-                className="input-field"
-                style={{ flex: 1, height: 68, resize: 'vertical', fontFamily: 'monospace', fontSize: 12 }}
-                placeholder='{"version":1,"type":"user_list_req","id":"lab-1","page":1,"limit":50}'
-                value={rawInput}
-                onChange={e => { setRawInput(e.target.value); setRawErr(''); }}
-                onKeyDown={e => { if (e.key === 'Enter' && e.ctrlKey) handleSendRaw(); }}
-              />
-              <button
-                id="send-raw-btn"
-                className="btn btn-primary"
-                style={{ height: 68, padding: '0 14px', flexShrink: 0 }}
-                onClick={handleSendRaw}
-                disabled={!rawInput.trim() || status !== 'connected'}
-              >
-                Send
-              </button>
-            </div>
-            {rawErr && <p className="form-error">{rawErr}</p>}
-          </div>
-        </div>
-
-        {/* Event log */}
-        <div className="lab-section">
-          <div className="lab-section__header"><h3>Event Log</h3></div>
-          <div
-            ref={logRef}
-            className="raw-log"
-            style={{ padding: '10px 14px', maxHeight: 240 }}
-            aria-label="Event log"
+      <div className="workspace__body" style={{ overflowY: 'auto', padding: '18px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {/* Navigation Tabs */}
+        <div className="tab-group" style={{ alignSelf: 'flex-start' }}>
+          <button
+            className={`tab-btn ${activeTab === 'metrics' ? 'active' : ''}`}
+            onClick={() => setActiveTab('metrics')}
           >
-            {log.map((e, i) => (
-              <div key={i} className="raw-log__line">
-                <span className="raw-log__ts">{e.ts}</span>
-                <span className={`raw-log__${e.dir}`}>{e.text}</span>
+            Connection Metrics
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'lens' ? 'active' : ''}`}
+            onClick={() => setActiveTab('lens')}
+          >
+            Protocol Lens ({protocolFrames.length} frames)
+          </button>
+          <button
+            className={`tab-btn ${activeTab === 'workbench' ? 'active' : ''}`}
+            onClick={() => setActiveTab('workbench')}
+          >
+            Interactive Workbench
+          </button>
+        </div>
+
+        {/* METRICS TAB */}
+        {activeTab === 'metrics' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Real Stats Grid */}
+            <div className="grid-2">
+              <div className="stat-card">
+                <div className="stat-card__value mono">{onlineUsers.length}</div>
+                <div className="stat-card__label">Active Registered Users</div>
               </div>
-            ))}
+              <div className="stat-card">
+                <div className="stat-card__value mono">{joinedRooms.length}</div>
+                <div className="stat-card__label">Rooms Currently Joined</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card__value mono">{inboundCount} / {outboundCount}</div>
+                <div className="stat-card__label">Frames (Inbound / Outbound)</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-card__value mono">
+                  {(inboundBytes / 1024).toFixed(1)} KB / {(outboundBytes / 1024).toFixed(1)} KB
+                </div>
+                <div className="stat-card__label">Wire Volume (In / Out)</div>
+              </div>
+            </div>
+
+            {/* Session Info */}
+            <div className="lab-section">
+              <div className="lab-section__header">
+                <h3 style={{ margin: 0, fontSize: 13 }}>Verified Connection Invariants</h3>
+              </div>
+              <div className="lab-section__body">
+                <div className="lens-attributes-table">
+                  <div className="attr-row">
+                    <span className="attr-key">Session Username</span>
+                    <span className="attr-val mono">{username ?? 'Not registered'}</span>
+                  </div>
+                  <div className="attr-row">
+                    <span className="attr-key">Session Duration</span>
+                    <span className="attr-val">{uptimeStr}</span>
+                  </div>
+                  <div className="attr-row">
+                    <span className="attr-key">Protocol Standard</span>
+                    <span className="attr-val">C++17 TCP Chat v1 JSON (strict \n framing, 2048 B limit)</span>
+                  </div>
+                  <div className="attr-row">
+                    <span className="attr-key">Bridge Session Isolation</span>
+                    <span className="attr-val" style={{ color: 'var(--accent)' }}>
+                      1:1 Dedicated TCP Socket per Browser Session
+                    </span>
+                  </div>
+                  <div className="attr-row">
+                    <span className="attr-key">Persistence Guarantee</span>
+                    <span className="attr-val" style={{ color: 'var(--accent)' }}>
+                      SQLite commit-before-ACK (Zero false acknowledgements)
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick Actions */}
+            <div className="lab-section">
+              <div className="lab-section__header">
+                <h3 style={{ margin: 0, fontSize: 13 }}>Standard Probes</h3>
+              </div>
+              <div className="lab-section__body" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <button id="lab-user-list" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestUsers}>
+                  Query user_list_req
+                </button>
+                <button id="lab-room-list" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestRooms}>
+                  Query room_list_req
+                </button>
+                <button id="lab-history" className="btn btn-secondary" style={{ fontSize: 12 }} onClick={onRequestHistory}>
+                  Query history_req (public)
+                </button>
+                <button
+                  id="lab-clear"
+                  className="btn btn-secondary"
+                  style={{ fontSize: 12, color: 'var(--error)' }}
+                  onClick={onClearMessages}
+                >
+                  Clear Chat Buffer ({messages.length})
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
+        )}
 
-        {/* Protocol reference */}
-        <div className="lab-section">
-          <div className="lab-section__header"><h3>Protocol Quick Reference (v1)</h3></div>
-          <div className="lab-section__body">
-            <div className="code-block">{`// Register (first message — locks connection to v1)
-{"version":1,"type":"register_req","id":"r1","username":"alice"}
-// → register_ack{status:"ok",username:"alice"}
+        {/* PROTOCOL LENS TAB */}
+        {activeTab === 'lens' && (
+          <ProtocolLens
+            frames={protocolFrames}
+            onClear={onClearFrames}
+          />
+        )}
 
-// Public broadcast (sender gets msg_ack; others get msg_broadcast)
-{"version":1,"type":"msg_send","id":"r2","content":"Hello!","to":"","room":""}
-// → msg_ack{id:"r2",status:"ok",msg_id:"msg-1"}   (server stored it)
+        {/* WORKBENCH TAB */}
+        {activeTab === 'workbench' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Presets */}
+            <div className="lab-section">
+              <div className="lab-section__header">
+                <h3 style={{ margin: 0, fontSize: 13 }}>Quick Protocol Frame Presets</h3>
+              </div>
+              <div className="lab-section__body" style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, border: '1px solid var(--border)' }}
+                  onClick={() => loadPreset({ version: 1, type: 'user_list_req', id: `probe-${Date.now()}`, page: 1, limit: 50 })}
+                >
+                  user_list_req
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, border: '1px solid var(--border)' }}
+                  onClick={() => loadPreset({ version: 1, type: 'room_list_req', id: `probe-${Date.now()}`, page: 1, limit: 50 })}
+                >
+                  room_list_req
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, border: '1px solid var(--border)' }}
+                  onClick={() => loadPreset({ version: 1, type: 'history_req', id: `probe-${Date.now()}`, conversation_type: 'public', limit: 10 })}
+                >
+                  history_req (public)
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, border: '1px solid var(--border)' }}
+                  onClick={() => loadPreset({ version: 1, type: 'msg_send', id: `probe-${Date.now()}`, content: 'Ping from System Lab workbench', to: '', room: '' })}
+                >
+                  msg_send (ping)
+                </button>
+              </div>
+            </div>
 
-// Private message (sender gets msg_direct_ack; recipient gets msg_direct)
-{"version":1,"type":"msg_direct_req","id":"r3","to":"bob","content":"Hey"}
-// → msg_direct_ack{id:"r3",status:"ok",msg_id:"msg-2","to":"bob"}
+            {/* Raw JSON Frame Sender */}
+            <div className="lab-section">
+              <div className="lab-section__header">
+                <h3 style={{ margin: 0, fontSize: 13 }}>Raw JSON Wire Frame Dispatcher</h3>
+                <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                  Sends exact newline-delimited JSON frame to C++ TCP server via bridge
+                </span>
+              </div>
+              <div className="lab-section__body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <textarea
+                  id="raw-frame-input"
+                  className="input-field"
+                  style={{ height: 110, fontFamily: 'monospace', fontSize: 12, lineHeight: 1.4 }}
+                  placeholder='{"version": 1, "type": "user_list_req", "id": "test-1", "page": 1, "limit": 50}'
+                  value={rawInput}
+                  onChange={e => { setRawInput(e.target.value); setRawErr(''); }}
+                />
 
-// Create room (auto-joins)
-{"version":1,"type":"room_create_req","id":"r4","room":"general"}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: 11, color: rawErr ? 'var(--error)' : 'var(--text-secondary)' }}>
+                    {rawErr || lastSentStatus || 'Frames must satisfy the 2048-byte limit and strict JSON specification.'}
+                  </span>
 
-// Join room
-{"version":1,"type":"room_join_req","id":"r5","room":"general"}
+                  <button
+                    id="send-raw-btn"
+                    className="btn btn-primary"
+                    style={{ height: 34, padding: '0 18px', gap: 6 }}
+                    onClick={handleSendRaw}
+                    disabled={!rawInput.trim() || status !== 'connected'}
+                  >
+                    <IcSend size={13} /> Dispatch Frame
+                  </button>
+                </div>
+              </div>
+            </div>
 
-// Room message (sender gets room_msg_ack; members get room_msg)
-{"version":1,"type":"room_msg_req","id":"r6","room":"general","content":"Hi!"}
-
-// User list
-{"version":1,"type":"user_list_req","id":"r7","page":1,"limit":50}
-
-// History (public)
-{"version":1,"type":"history_req","id":"r8","conversation_type":"public","limit":20}
-
-// History (direct)
-{"version":1,"type":"history_req","id":"r9","conversation_type":"direct","with":"bob","limit":20}
-
-// Graceful disconnect
-{"version":1,"type":"disconnect_req","id":"r10"}`}</div>
+            {/* Protocol Spec Reference */}
+            <div className="lab-section">
+              <div className="lab-section__header">
+                <h3 style={{ margin: 0, fontSize: 13 }}>Protocol Contract Rules (v1)</h3>
+              </div>
+              <div className="lab-section__body" style={{ fontSize: 12, lineHeight: 1.6, color: 'var(--text-primary)' }}>
+                <ul style={{ margin: 0, paddingLeft: 18 }}>
+                  <li><strong>First Frame Isolation:</strong> First received frame identifies protocol mode (v1 structured vs v0 legacy). Once set, it cannot switch.</li>
+                  <li><strong>Commit Before ACK:</strong> The server commits message content to SQLite before dispatching <code>msg_ack</code>. Storage failures immediately abort broadcasts.</li>
+                  <li><strong>Sender Exclusion:</strong> Senders receive correlated acknowledgements (`msg_ack`, `room_msg_ack`, `msg_direct_ack`) and are excluded from peer broadcasts.</li>
+                  <li><strong>Privacy Preservation:</strong> Private messages and direct history queries are restricted strictly to participants. Third parties receive <code>ERR_UNAUTHORIZED</code>.</li>
+                  <li><strong>Room Lifecycles:</strong> Chat rooms are ephemeral in-memory entities. When the last member leaves, the room is deleted.</li>
+                </ul>
+              </div>
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

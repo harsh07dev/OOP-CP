@@ -10,10 +10,12 @@
  */
 import { Fragment, useEffect, useRef } from 'react';
 import type { ChatMessage, MessageStatus } from '../types';
+import { IcFlightRecorder } from './icons';
 
 interface MessageFeedProps {
   messages: ChatMessage[];
   currentUser: string;
+  onSelectMessage?: (msg: ChatMessage) => void;
 }
 
 const initials = (name: string) => name.slice(0, 2).toUpperCase();
@@ -67,7 +69,7 @@ function StatusBadge({ status, kind: _kind }: { status?: MessageStatus; kind: st
   return null;
 }
 
-export default function MessageFeed({ messages, currentUser: _currentUser }: MessageFeedProps) {
+export default function MessageFeed({ messages, currentUser: _currentUser, onSelectMessage }: MessageFeedProps) {
   const feedRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const nearBottomRef = useRef(true);
@@ -161,9 +163,24 @@ export default function MessageFeed({ messages, currentUser: _currentUser }: Mes
                     </div>
                   )}
 
-                  {/* Bubble */}
-                  <div className={`message-bubble${isPrivate && !isOwn ? ' private' : ''}`}>
-                    {msg.body}
+                  {/* Bubble & Actions */}
+                  <div className="message-bubble-wrap">
+                    <div className={`message-bubble${isPrivate && !isOwn ? ' private' : ''}`}>
+                      {msg.body}
+                    </div>
+                    {onSelectMessage && (
+                      <button
+                        className="btn-msg-inspect"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectMessage(msg);
+                        }}
+                        title="Open in Message Flight Recorder"
+                        aria-label="Inspect message"
+                      >
+                        <IcFlightRecorder size={12} />
+                      </button>
+                    )}
                   </div>
 
                   {/* Own message: time + status (no simulated states) */}

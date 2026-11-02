@@ -38,6 +38,7 @@ export default function App() {
   useEffect(() => {
     if (api.username) {
       api.requestUserList();
+      api.requestRoomList();
     }
   }, [api.username]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -46,20 +47,7 @@ export default function App() {
     api.connect(bridgeUrl, username);
   }, [api]);
 
-  // Raw JSON sender for System Lab
-  const handleSendRaw = useCallback((json: string) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(json);
-    }
-  }, []);
-
-  // Expose internal WS for Lab raw sender via a module-level ref
-  const wsRef = useRef<WebSocket | null>(null);
   useEffect(() => {
-    // We can't access the WS directly from the hook, so the Lab will
-    // use the hook's sendPublic with a custom type workaround.
-    // For true raw sending we register a global accessor.
     ((window as unknown) as Record<string, unknown>).__chatSocketAPI = api;
   }, [api]);
 
@@ -95,6 +83,8 @@ export default function App() {
         <PeopleView
           username={api.username ?? ''}
           onlineUsers={api.onlineUsers}
+          totalUsers={api.totalUsers}
+          presenceEvents={api.presenceEvents}
           onRequestUsers={api.requestUserList}
           onOpenDm={(peer) => {
             setActiveContext({ type: 'dm', peer });
@@ -112,10 +102,14 @@ export default function App() {
         <RoomsView
           username={api.username ?? ''}
           joinedRooms={api.joinedRooms}
+          discoveredRooms={api.discoveredRooms}
+          roomMembers={api.roomMembers}
+          roomEvents={api.roomEvents}
           onJoinRoom={api.joinRoom}
           onCreateRoom={api.createRoom}
           onLeaveRoom={api.leaveRoom}
           onRequestRooms={api.requestRoomList}
+          onRequestRoomMembers={api.requestRoomMembers}
           onContextChange={setActiveContext}
           onViewChange={(v) => setActiveView(v)}
         />
@@ -126,6 +120,8 @@ export default function App() {
           joinedRooms={api.joinedRooms}
           onlineUsers={api.onlineUsers}
           historyEntries={api.historyEntries}
+          historyHasMore={api.historyHasMore}
+          historyCount={api.historyCount}
           onRequestHistory={api.requestHistory}
         />
       )}
@@ -137,11 +133,18 @@ export default function App() {
           onlineUsers={api.onlineUsers}
           joinedRooms={api.joinedRooms}
           messages={api.messages}
+          protocolFrames={api.protocolFrames}
+          connectedAt={api.connectedAt}
+          inboundCount={api.inboundCount}
+          outboundCount={api.outboundCount}
+          inboundBytes={api.inboundBytes}
+          outboundBytes={api.outboundBytes}
           onRequestUsers={api.requestUserList}
           onRequestRooms={api.requestRoomList}
-          onRequestHistory={() => api.requestHistory('public')}
+          onRequestHistory={() => api.requestHistory('public', { limit: 20 })}
           onClearMessages={api.clearMessages}
-          onSendRaw={handleSendRaw}
+          onClearFrames={api.clearProtocolFrames}
+          onSendRaw={api.sendRawFrame}
         />
       )}
     </div>

@@ -1,14 +1,15 @@
 /**
  * ChatsView.tsx — Main chat workspace.
  * Correctly routes messages to public / room / DM contexts.
- * Filtering is purely client-side based on message kind + room/target.
+ * Supports Message Flight Recorder inspection for any selected message.
  */
-import { useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import type { ChatContext, ChatMessage } from '../types';
 import ChatSidebar from './ChatSidebar';
 import MessageFeed from './MessageFeed';
 import ComposeBar from './ComposeBar';
-import { IcHash, IcUser, IcRefresh } from './icons';
+import FlightRecorder from './FlightRecorder';
+import { IcHash, IcUser, IcRefresh, IcFlightRecorder } from './icons';
 import type { ChatSocketAPI } from '../hooks/useChatSocket';
 
 interface ChatsViewProps {
@@ -52,6 +53,7 @@ function filterMessages(messages: ChatMessage[], ctx: ChatContext, _me: string):
 
 export default function ChatsView({ api, activeContext, onContextChange }: ChatsViewProps) {
   const { username, onlineUsers, joinedRooms, messages } = api;
+  const [selectedMessage, setSelectedMessage] = useState<ChatMessage | null>(null);
 
   const visibleMessages = filterMessages(messages, activeContext, username ?? '');
 
@@ -70,7 +72,6 @@ export default function ChatsView({ api, activeContext, onContextChange }: Chats
   }, [activeContext, api]);
 
   const handleJoinRoom = useCallback((room: string) => {
-    // Try join first; if server says ERR_ROOM_NOT_FOUND, create it
     api.joinRoom(room);
     onContextChange({ type: 'room', room });
   }, [api, onContextChange]);
@@ -106,11 +107,21 @@ export default function ChatsView({ api, activeContext, onContextChange }: Chats
             <span className="text-xs text-secondary">{contextSubtitle()}</span>
           </div>
           <div className="workspace__header-right">
+            {visibleMessages.length > 0 && (
+              <button
+                className={`btn btn-ghost btn-icon ${selectedMessage ? 'btn-active' : ''}`}
+                title="Inspect latest message in Flight Recorder"
+                onClick={() => setSelectedMessage(selectedMessage ? null : visibleMessages[visibleMessages.length - 1])}
+                aria-label="Toggle flight recorder"
+              >
+                <IcFlightRecorder size={15} />
+              </button>
+            )}
             <button
               id="refresh-users-btn"
               className="btn btn-ghost btn-icon"
               title="Refresh user list"
-              onClick={api.requestUserList}
+              onClick={() => api.requestUserList()}
               aria-label="Refresh user list"
             >
               <IcRefresh size={14} />
@@ -118,8 +129,23 @@ export default function ChatsView({ api, activeContext, onContextChange }: Chats
           </div>
         </div>
 
-        <MessageFeed messages={visibleMessages} currentUser={username ?? ''} />
-        <ComposeBar context={activeContext} onSend={handleSend} />
+        <div className="workspace-main-row" style={{ display: 'flex', flex: 1, minHeight: 0, position: 'relative' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, height: '100%' }}>
+            <MessageFeed
+              messages={visibleMessages}
+              currentUser={username ?? ''}
+              onSelectMessage={setSelectedMessage}
+            />
+            <ComposeBar context={activeContext} onSend={handleSend} />
+          </div>
+
+          {selectedMessage && (
+            <FlightRecorder
+              message={selectedMessage}
+              onClose={() => setSelectedMessage(null)}
+            />
+          )}
+        </div>
       </div>
     </>
   );
